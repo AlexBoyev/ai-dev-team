@@ -1,26 +1,32 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 from backend.agents import DeveloperAgent, DevOpsAgent, QaAgent, ReviewerAgent
 from backend.agents.manager import ManagerAgent
-from backend.core.memory import (
-    TaskState,
-    add_log,
-    get_run_in_progress,
-    set_run_in_progress,
-    snapshot_for_api,
-    update_agent,
-    update_task,
-    upsert_task,
-)
-from backend.core.persistence import new_run_id, snapshot_run
 from backend.core.tasks import PlannedTask
+from backend.db.models import AgentEvent, Artifact, Log, Repository, Run, Task
+from backend.db.session import get_db_session
 from backend.tools.tool_registry import ToolContext
 
 WORKSPACE_ROOT = Path("workspace")
+
+ARTIFACT_FILES = [
+    "report.md",
+    "code_summary.md",
+    "qa_findings.md",
+    "review.md",
+    "final_summary.md",
+    "repo_inventory.json",
+    "selected_files.json",
+]
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _ensure_workspace() -> Path:
@@ -29,23 +35,35 @@ def _ensure_workspace() -> Path:
     return root
 
 
-def _new_task(title: str, assigned_agent: str) -> TaskState:
-    return TaskState(
-        id=str(uuid.uuid4())[:8],
-        title=title,
-        status="pending",
-        assigned_agent=assigned_agent,
-        result=None,
-    )
+def _add_log(db, run_id: str, level: str, source: str, message: str) -> None:
+    db.add(Log(
+        run_id=run_id,
+        ts=utcnow(),
+        level=level,
+        source=source,
+        message=message,
+    ))
+    db.commit()
+
+
+def _update_agent(db, run_id: str, agent_key: str, status: str, action: str = "") -> None:
+    db.add(AgentEvent(
+        run_id=run_id,
+        agent_key=agent_key,
+        status=status,
+        action=action,
+        ts=utcnow(),
+    ))
+    db.commit()
 
 
 def _build_agents() -> Dict[str, Any]:
     return {
-        "manager": ManagerAgent(),
-        "dev_1": DeveloperAgent(agent_id="dev_1"),
-        "qa_1": QaAgent(agent_id="qa_1"),
+        "manager":  ManagerAgent(),
+        "dev_1":    DeveloperAgent(agent_id="dev_1"),
+        "qa_1":     QaAgent(agent_id="qa_1"),
         "reviewer": ReviewerAgent(agent_id="reviewer"),
-        "devops": DevOpsAgent(agent_id="devops"),
+        "devops":   DevOpsAgent(agent_id="devops"),
     }
 
 
@@ -71,132 +89,222 @@ def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, An
         payload["selected_files"] = artifacts.get("selected_files", [])
 
     elif task.task_type == "build_qa_findings":
-        payload["workspace_files"] = artifacts.get("workspace_files", [])
+        payload["workspace_files"]    = artifacts.get("workspace_files", [])
         payload["workspace_metadata"] = artifacts.get("workspace_metadata", [])
-        payload["selected_files"] = artifacts.get("selected_files", [])
-        payload["report_md"] = artifacts.get("report_md", "")
+        payload["selected_files"]     = artifacts.get("selected_files", [])
+        payload["report_md"]          = artifacts.get("report_md", "")
 
     elif task.task_type == "review_outputs":
-        payload["report_md"] = artifacts.get("report_md", "")
+        payload["report_md"]       = artifacts.get("report_md", "")
         payload["code_summary_md"] = artifacts.get("code_summary_md", "")
-        payload["qa_findings_md"] = artifacts.get("qa_findings_md", "")
+        payload["qa_findings_md"]  = artifacts.get("qa_findings_md", "")
 
     elif task.task_type == "write_artifacts":
-        payload["workspace_files"] = artifacts.get("workspace_files", [])
-        payload["selected_files"] = artifacts.get("selected_files", [])
-        payload["report_md"] = artifacts.get("report_md", "")
-        payload["code_summary_md"] = artifacts.get("code_summary_md", "")
-        payload["qa_findings_md"] = artifacts.get("qa_findings_md", "")
-        payload["review_md"] = artifacts.get("review_md", "")
+        payload["workspace_files"]  = artifacts.get("workspace_files", [])
+        payload["selected_files"]   = artifacts.get("selected_files", [])
+        payload["report_md"]        = artifacts.get("report_md", "")
+        payload["code_summary_md"]  = artifacts.get("code_summary_md", "")
+        payload["qa_findings_md"]   = artifacts.get("qa_findings_md", "")
+        payload["review_md"]        = artifacts.get("review_md", "")
 
     return payload
 
 
-def demo_run(repo_url: str | None = None) -> None:
-    if get_run_in_progress():
-        add_log("INFO", "orchestrator", "Run request ignored: run already in progress.")
+def _register_repo(
+    db,
+    run_id: str,
+    artifacts: Dict[str, Any],
+    workspace_root: Path,
+) -> None:
+    """
+    Called after clone_git_repo task completes.
+    Inserts or updates a Repository row in the DB.
+    """
+    repo_path_rel = artifacts.get("repo_path", "")
+    if not repo_path_rel:
         return
 
-    set_run_in_progress(True)
+    full_path = workspace_root / repo_path_rel
+    name = full_path.name
 
-    run_id = new_run_id()
-    workspace_root = _ensure_workspace()
-    ctx = ToolContext(workspace_root=workspace_root)
-    artifacts: Dict[str, Any] = {}
-    agents = _build_agents()
-    manager = agents["manager"]
-    current_task_id: str | None = None
+    # Calculate total disk usage (exclude .git)
+    disk_bytes = 0
+    if full_path.exists():
+        disk_bytes = sum(
+            f.stat().st_size
+            for f in full_path.rglob("*")
+            if f.is_file() and ".git" not in f.parts
+        )
+
+    existing = db.query(Repository).filter(Repository.name == name).first()
+    if existing:
+        existing.disk_bytes  = disk_bytes
+        existing.last_run_id = run_id
+        existing.updated_at  = utcnow()
+    else:
+        db.add(Repository(
+            name=name,
+            url=artifacts.get("repo_url", ""),
+            local_path=str(full_path),
+            disk_bytes=disk_bytes,
+            last_run_id=run_id,
+            cloned_at=utcnow(),
+            updated_at=utcnow(),
+        ))
+
+    db.commit()
+
+
+def _register_artifacts(
+    db,
+    run_id: str,
+    workspace_root: Path,
+) -> None:
+    """
+    Called after write_artifacts task completes.
+    Inserts an Artifact row for each output file that exists on disk.
+    Skips files already registered for this run.
+    """
+    for name in ARTIFACT_FILES:
+        path = workspace_root / name
+        if not path.exists():
+            continue
+
+        already = (
+            db.query(Artifact)
+            .filter(Artifact.run_id == run_id, Artifact.name == name)
+            .first()
+        )
+        if already:
+            continue
+
+        db.add(Artifact(
+            run_id=run_id,
+            name=name,
+            path=str(path),
+            size_bytes=path.stat().st_size,
+        ))
+
+    db.commit()
+
+
+def demo_run(run_id: str, repo_url: str | None = None) -> None:
+    db = get_db_session()
 
     try:
-        add_log(
-            "INFO",
-            "orchestrator",
-            f"Run started | run_id={run_id} | workspace={workspace_root} | repo_url={repo_url or '[missing]'}",
-        )
-        snapshot_run(snapshot_for_api(), run_id, note="run_started")
+        workspace_root  = _ensure_workspace()
+        ctx             = ToolContext(workspace_root=workspace_root)
+        artifacts: Dict[str, Any] = {}
+        agents          = _build_agents()
+        manager         = agents["manager"]
+        current_task_db_id: str | None = None
 
-        update_agent(
-            "manager",
-            status="working",
-            current_task_id=None,
-            last_action="Building task plan",
-        )
+        _add_log(db, run_id, "INFO", "orchestrator",
+                 f"Run started | run_id={run_id} | repo_url={repo_url or '[missing]'}")
 
+        # ── Manager builds the plan ──────────────────────────────────────
+        _update_agent(db, run_id, "manager", "working", "Building task plan")
         plan = manager.build_plan(repo_url=repo_url)
+        _update_agent(db, run_id, "manager", "idle", "Plan created")
 
-        update_agent(
-            "manager",
-            status="idle",
-            current_task_id=None,
-            last_action="Plan created",
-        )
-
+        # ── Execute each planned task ────────────────────────────────────
         for planned in plan:
-            task = _new_task(planned.title, planned.assigned_agent)
-            current_task_id = task.id
 
-            upsert_task(task)
-            update_task(task.id, status="in_progress")
+            # Create task row
+            task_db_id         = str(uuid.uuid4())
+            current_task_db_id = task_db_id
 
-            update_agent(
-                planned.assigned_agent,
-                status="working",
-                current_task_id=task.id,
+            task_row = Task(
+                id=task_db_id,
+                run_id=run_id,
+                title=planned.title,
+                task_type=planned.task_type,
+                assigned_agent=planned.assigned_agent,
+                status="pending",
+                created_at=utcnow(),
+                updated_at=utcnow(),
             )
+            db.add(task_row)
+            db.commit()
 
+            # Mark in_progress
+            task_row.status     = "in_progress"
+            task_row.updated_at = utcnow()
+            db.commit()
+
+            _update_agent(db, run_id, planned.assigned_agent,
+                          "working", f"Starting: {planned.title}")
+
+            # Run the agent
             payload = _build_payload(planned, artifacts)
-            agent = agents[planned.assigned_agent]
-            result = agent.run_task(planned.task_type, ctx, payload)
+            agent   = agents[planned.assigned_agent]
+            result  = agent.run_task(planned.task_type, ctx, payload)
 
+            # Pass results forward to downstream tasks
             for key, value in result.items():
                 if key != "result_message":
                     artifacts[key] = value
 
             result_message = str(result.get("result_message", "Done"))
 
-            update_task(
-                task.id,
-                status="completed",
-                result=result_message,
-            )
+            # Mark completed
+            task_row.status     = "completed"
+            task_row.result     = result_message
+            task_row.updated_at = utcnow()
+            db.commit()
 
-            update_agent(
-                planned.assigned_agent,
-                status="idle",
-                current_task_id=None,
-                last_action=result_message,
-            )
+            _update_agent(db, run_id, planned.assigned_agent, "idle", result_message)
 
-            add_log(
-                "INFO",
-                "orchestrator",
-                f"Task completed | task_id={task.id} | agent={planned.assigned_agent} | message={result_message}",
-            )
+            _add_log(db, run_id, "INFO", "orchestrator",
+                     f"Task completed | agent={planned.assigned_agent} | {result_message}")
 
-        add_log("INFO", "orchestrator", f"Run finished | run_id={run_id}")
-        snapshot_run(snapshot_for_api(), run_id, note="run_finished")
+            # ── Post-task hooks ──────────────────────────────────────────
+
+            # After clone: register repo in DB
+            if planned.task_type == "clone_git_repo":
+                _register_repo(db, run_id, artifacts, workspace_root)
+
+            # After write_artifacts: register output files in DB
+            if planned.task_type == "write_artifacts":
+                _register_artifacts(db, run_id, workspace_root)
+
+        # ── Mark run completed ───────────────────────────────────────────
+        run_row = db.query(Run).filter(Run.id == run_id).first()
+        if run_row:
+            run_row.status      = "completed"
+            run_row.finished_at = utcnow()
+            db.commit()
+
+        _add_log(db, run_id, "INFO", "orchestrator",
+                 f"Run finished | run_id={run_id}")
 
     except Exception as e:
-        add_log("ERROR", "orchestrator", f"Run failed | run_id={run_id} | error={e}")
+        _add_log(db, run_id, "ERROR", "orchestrator",
+                 f"Run failed | run_id={run_id} | error={e}")
 
-        if current_task_id:
+        # Mark current task failed
+        if current_task_db_id:
             try:
-                update_task(current_task_id, status="failed", result=str(e))
+                t = db.query(Task).filter(Task.id == current_task_db_id).first()
+                if t:
+                    t.status     = "failed"
+                    t.result     = str(e)
+                    t.updated_at = utcnow()
+                    db.commit()
             except Exception:
                 pass
 
-        for agent_key in ["manager", "dev_1", "qa_1", "reviewer", "devops"]:
-            try:
-                update_agent(
-                    agent_key,
-                    status="idle",
-                    current_task_id=None,
-                )
-            except Exception:
-                pass
+        # Mark run failed
+        try:
+            run_row = db.query(Run).filter(Run.id == run_id).first()
+            if run_row:
+                run_row.status      = "failed"
+                run_row.finished_at = utcnow()
+                db.commit()
+        except Exception:
+            pass
 
-        snapshot_run(snapshot_for_api(), run_id, note="run_failed")
         raise
 
     finally:
-        set_run_in_progress(False)
+        db.close()

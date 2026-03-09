@@ -1,0 +1,82 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aidevteam
+      POSTGRES_USER: aiuser
+      POSTGRES_PASSWORD: aipass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiuser -d aidevteam"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://aiuser:aipass@postgres:5432/aidevteam
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - workspace_data:/app/workspace
+      - app_data:/app/data
+    command: >
+      sh -c "
+        alembic upgrade head &&
+        uvicorn backend.main:app --host 0.0.0.0 --port 8010
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8010/api/state"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://aiuser:aipass@postgres:5432/aidevteam
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - workspace_data:/app/workspace
+      - app_data:/app/data
+    command: >
+      celery -A backend.tasks.celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --queues=pipeline
+
+volumes:
+  pgdata:
+  workspace_data:
+  app_data:
