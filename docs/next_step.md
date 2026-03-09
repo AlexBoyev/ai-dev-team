@@ -1,464 +1,321 @@
-# Next Step Plan — GitHub URL Input + Repo Clone + Real Repository Analysis
+# Next Step — Repository Intelligence + Analysis Limits + Artifact UX
 
-## Current System
+## Current phase
 
-You already built a working multi-agent pipeline:
-
-Agents
-- manager
-- dev_1 (Developer)
-- qa_1 (Tester)
-- reviewer
-- devops
-
-Architecture
-- orchestrator → agents → tool registry → workspace
-- UI dashboard with Run / Reset
+The project already has:
+- FastAPI backend + dashboard UI
+- Run/Reset flow
 - `/api/state` polling
-- persistent state/logs
-- artifacts written to workspace
+- orchestrator → agents → tools pipeline
+- repo cloning into `workspace/repos/<repo_name>`
+- artifact generation:
+  - `report.md`
+  - `code_summary.md`
+  - `qa_findings.md`
+  - `review.md`
+  - `final_summary.md`
 
-Generated artifacts
+The next milestone is **not** adding more scaffolding.
+The next milestone is making the analyzer smarter, safer, and easier to consume.
+
+---
+
+## Milestone goal
+
+Teach the system to answer:
+
+1. What is this project?
+2. How does it likely run?
+3. Where should I start reading?
+4. Is the repo too large / noisy to analyze fully?
+5. Where can I open the generated artifacts in the UI?
+
+---
+
+## Deliverables
+
+By the end of this step, the system should:
+
+- detect likely project type
+- detect languages / frameworks / tools
+- detect likely run/build/test hints
+- produce a recommended reading order
+- enforce safe indexing / summarization limits
+- clearly report skipped files and truncation
+- expose generated artifact file links in the UI
+- include tests for the new logic
+
+---
+
+## Implementation plan
+
+### Step 1 — Improve DeveloperAgent intelligence
+**File:** `backend/agents/developer_agent.py`
+
+Add / keep:
+- ignored directories
+- blocked extensions
+- allowed text/source extensions
+- max indexed files
+- max selected files
+- max file size for summarization
+
+Add repo intelligence sections to `report.md`:
+- Project overview
+- How it likely runs
+- Where to start reading
+- Important files
+- Entrypoint candidates
+- Repository limits and indexing
+
+Expected output examples:
+- Project type: Python application
+- Languages: Python, Markdown
+- Frameworks / tools: Python project, Docker
+- Likely run: `python main.py`
+- Reading order:
+  1. README.md
+  2. requirements.txt
+  3. main.py
+
+---
+
+### Step 2 — Keep tool layer safe
+**File:** `backend/tools/tool_registry.py`
+
+Ensure tools:
+- ignore junk directories like:
+  - `.git`
+  - `node_modules`
+  - `dist`
+  - `build`
+  - `.venv`
+  - `venv`
+  - `.idea`
+  - `.vscode`
+- raise `ToolError` for unreadable/non-UTF8 text files
+- never escape `workspace/`
+
+This is mostly done, but verify it is the final stable version.
+
+---
+
+### Step 3 — Upgrade QA findings
+**File:** `backend/agents/qa_agent.py`
+
+Add rule-based QA checks for:
+- missing README
+- missing test directory
+- missing dependency manifest
+- missing entrypoint
+- missing Docker support
+- TODO / FIXME / HACK counts
+- suspiciously large files
+- repo size risks
+
+Expected `qa_findings.md` sections:
+- Inventory summary
+- Structure checks
+- Deferred work markers
+- Large files
+- Risks
+- Strengths
+
+---
+
+### Step 4 — Upgrade ReviewerAgent
+**File:** `backend/agents/reviewer_agent.py`
+
+Make reviewer validate:
+- artifact presence
+- artifact length
+- target subdir consistency
+- report coverage
+- QA coverage
+- code summary coverage
+
+Expected `review.md` sections:
+- Overall status
+- Artifact presence
+- Consistency checks
+- Coverage checks
+- Strengths
+- Concerns
+- Recommended next actions
+
+---
+
+### Step 5 — Improve DevOps artifact writing
+**File:** `backend/agents/devops_agent.py`
+
+Keep:
+- `clone_repository`
+- `write_artifacts`
+
+Improve `write_artifacts` to also generate a better `final_summary.md` with:
+- review status
+- indexed file count
+- selected file count
+- project type
+- languages
+- frameworks/tools
+- reading order
+- entrypoints
+- run hints
+- QA highlights
+- review highlights
+- next actions
+
+---
+
+### Step 6 — Keep orchestrator aligned
+**File:** `backend/core/orchestrator.py`
+
+Make sure `_build_payload()` passes the correct artifacts:
+
+For `build_qa_findings`:
+- `workspace_files`
+- `workspace_metadata`
+- `selected_files`
+- `report_md`
+
+For `review_outputs`:
+- `report_md`
+- `code_summary_md`
+- `qa_findings_md`
+- `target_subdir`
+
+For `write_artifacts`:
+- `workspace_files`
+- `selected_files`
+- `report_md`
+- `code_summary_md`
+- `qa_findings_md`
+- `review_md`
+- `target_subdir`
+
+No manager change needed right now.
+
+---
+
+### Step 7 — Add artifact links to UI
+**Files:**
+- `backend/api/routes.py`
+- `frontend/templates/index.html`
+- `frontend/static/app.js`
+- optionally `frontend/static/styles.css`
+
+Add a lightweight endpoint such as:
+- `GET /api/artifacts`
+
+Return available generated files from `workspace/`, for example:
+- `report.md`
+- `code_summary.md`
+- `qa_findings.md`
+- `review.md`
+- `final_summary.md`
+- `repo_inventory.json`
+- `selected_files.json`
+
+UI should show:
+- clickable artifact list
+- artifact section visible after run
+- no redesign needed
+
+Example display:
 - report.md
 - code_summary.md
 - qa_findings.md
 - review.md
 - final_summary.md
-- repo_inventory.json
-- selected_files.json
 
-Current limitation:
-
-The system expects a repo already inside `workspace/`, so analysis returns 0 files unless a repo exists locally.
+Optional next step later:
+- preview artifact content in a panel
 
 ---
 
-# Goal of This Step
+### Step 8 — Add tests
+**Files:**
+- `tests/test_agents.py`
+- `tests/test_orchestrator.py`
+- maybe new:
+  - `tests/test_repo_intelligence.py`
+  - `tests/test_tool_registry.py`
 
-Allow the **user to enter a GitHub repository URL in the UI**.
-
-The system should:
-
-1. accept GitHub URL
-2. clone repo automatically
-3. analyze cloned repo
-4. generate reports
-
----
-
-# Target Execution Flow
-
-User enters GitHub URL
-
-→ Run button  
-→ backend receives repo_url  
-→ manager builds plan  
-→ devops clones repo  
-→ developer analyzes repo  
-→ qa generates findings  
-→ reviewer evaluates outputs  
-→ devops writes artifacts  
-
-All agents operate **only inside workspace/**.
+Add tests for:
+- ignored directories are skipped
+- `.git` files never enter analysis
+- binary/unreadable files are skipped safely
+- repo intelligence detects common files
+- reading order is generated
+- run hints are generated
+- large repo truncation is reported
+- all artifacts use same target subdir
+- final summary is created
 
 ---
 
-# Workspace Layout After Run
+## Suggested order of implementation
 
+1. Finalize `developer_agent.py`
+2. Finalize `qa_agent.py`
+3. Finalize `reviewer_agent.py`
+4. Finalize `devops_agent.py`
+5. Finalize `orchestrator.py`
+6. Add `/api/artifacts`
+7. Update UI to show artifact links
+8. Add tests
 
-workspace/
-repos/
-fastapi/
-report.md
-code_summary.md
-qa_findings.md
-review.md
-final_summary.md
-repo_inventory.json
-selected_files.json
-
+This order keeps the backend artifact pipeline stable before touching the frontend.
 
 ---
 
-# Files To Modify
+## Success checklist
 
-Backend
+A successful run should now produce:
 
-backend/
-agents/
-manager.py
-devops_agent.py
-core/
-orchestrator.py
-api/
-routes.py
-tools/
-tool_registry.py
+- `workspace/report.md`
+- `workspace/code_summary.md`
+- `workspace/qa_findings.md`
+- `workspace/review.md`
+- `workspace/final_summary.md`
+- `workspace/repo_inventory.json`
+- `workspace/selected_files.json`
 
+And these should all:
+- reference the same `Target subdir`
+- contain useful project identity info
+- contain run/read guidance
+- survive mixed repos without crashing
 
-Frontend
-
-frontend/
-templates/index.html
-static/app.js
-
-
----
-
-# Step 1 — Add Git Clone Tool
-
-File
-
-
-backend/tools/tool_registry.py
-
-
-Add a new tool:
-
-
-clone_git_repo
-
-
-Responsibilities
-
-- accept repo_url
-- clone repository into:
-
-
-workspace/repos/<repo_name>
-
-
-- return relative path:
-
-
-repos/<repo_name>
-
-
-Requirements
-
-- use:
-
-
-git clone --depth 1
-
-
-- skip clone if repo already exists
-- must remain inside workspace
-- raise clear error on clone failure
+UI should:
+- still support Run / Reset
+- still use `/api/state` polling
+- show artifact links after run
 
 ---
 
-# Step 2 — Extend DevOps Agent
+## What comes after this milestone
 
-File
+After Repository Intelligence + Analysis Limits + Artifact UX is stable, then the next milestone should be:
 
+### Real autonomous code agents
+Examples:
+- propose changes
+- edit files inside `workspace/`
+- create patch suggestions
+- write implementation plans
+- later integrate an LLM
 
-backend/agents/devops_agent.py
-
-
-Add new task:
-
-
-clone_repository
-
-
-Behavior
-
-1. read repo_url from payload
-2. call tool `clone_git_repo`
-3. return result:
-
-
-{
-"repo_path": "repos/<repo_name>",
-"result_message": "Repository cloned"
-}
-
-
-This prepares the repository before analysis tasks begin.
+But do **not** do that before this repo-intelligence layer is stable.
 
 ---
 
-# Step 3 — Update Manager Agent
+## Important note for next chat
 
-File
+When opening the next chat, say:
 
-
-backend/agents/manager.py
-
-
-Manager should now:
-
-- accept optional `repo_url`
-- use default repo if empty
-- create clone task first
-
-Example plan
-
-1 Clone repository  
-2 Inventory files  
-3 Select key files  
-4 Summarize files  
-5 Scan repository structure  
-6 Generate QA findings  
-7 Review outputs  
-8 Write artifacts  
-
-Manager must extract repository name from the GitHub URL.
-
-Example
-
-
-https://github.com/tiangolo/fastapi
-
-
-repo_name
-
-
-fastapi
-
-
----
-
-# Step 4 — Update Orchestrator
-
-File
-
-
-backend/core/orchestrator.py
-
-
-Modify main run function:
-
-
-demo_run(repo_url: str | None)
-
-
-Pass repo_url to:
-
-
-manager.build_plan(repo_url)
-
-
----
-
-## Payload Injection
-
-After cloning, devops returns:
-
-
-artifacts["repo_path"]
-
-
-Orchestrator must inject this into later tasks.
-
-Tasks requiring repo path
-
-- inventory_workspace
-- select_key_files
-- summarize_key_files
-- scan_and_report
-- build_qa_findings
-
-Payload should include
-
-
-payload["target_subdir"] = artifacts["repo_path"]
-
-
----
-
-# Step 5 — Update API Route
-
-File
-
-
-backend/api/routes.py
-
-
-Modify `/api/run`.
-
-It should accept JSON body.
-
-Example request
-
-
-POST /api/run
-{
-"repo_url": "https://github.com/tiangolo/fastapi
-"
-}
-
-
-Route should
-
-1 read repo_url  
-2 start background thread  
-3 call
-
-
-demo_run(repo_url)
-
-
-Keep current behavior
-
-- asynchronous run
-- single run at a time
-- UI polling unchanged
-
----
-
-# Step 6 — Update UI
-
-File
-
-
-frontend/templates/index.html
-
-
-Add input field above Run button.
-
-Example
-
-
-[ GitHub repository URL __________________ ]
-
-[ Run ] [ Reset ]
-
-
-Use id
-
-
-repo-url-input
-
-
-Placeholder
-
-
-https://github.com/owner/repo
-
-
-Do not redesign the UI layout.
-
----
-
-# Step 7 — Update Frontend JavaScript
-
-File
-
-
-frontend/static/app.js
-
-
-Modify Run button handler.
-
-Steps
-
-1 read value from input
-
-
-document.getElementById("repo-url-input")
-
-
-2 send POST request
-
-
-/api/run
-
-
-with body
-
-
-{ "repo_url": "<value>" }
-
-
-Example
-
-
-fetch("/api/run", {
-method: "POST",
-headers: { "Content-Type": "application/json" },
-body: JSON.stringify({ repo_url })
-})
-
-
-Keep polling logic unchanged.
-
----
-
-# Step 8 — Testing
-
-Test 1
-
-Input
-
-
-https://github.com/tiangolo/fastapi
-
-
-Expected dashboard logs
-
-- Repository cloned
-- Indexed hundreds of files
-- Selected key files
-- Summarized files
-- QA findings generated
-- Review complete
-- Artifacts written
-
----
-
-Test 2
-
-Empty input
-
-Expected
-
-Manager uses default repo.
-
----
-
-Test 3
-
-Invalid GitHub URL
-
-Expected
-
-- clone fails
-- clear error logged
-- run stops safely
-
----
-
-# Step 9 — Done Criteria
-
-This milestone is complete when
-
-- UI accepts GitHub URL
-- `/api/run` accepts JSON input
-- manager builds clone-first plan
-- devops clones repo
-- developer analyzes repo
-- qa generates findings
-- reviewer evaluates outputs
-- devops writes artifacts
-- UI still works with polling
-- no manual repo setup required
-
----
-
-# Next Step After This
-
-Future milestone
-
-
-LLM-powered agents
-
-
-Developer agent will:
-
-- decide which tools to use
-- explore repository
-- propose improvements
-
-This will turn the system into a **real autonomous dev-team simulator**.
+> Read docs/PROJECT_CONTEXT.md and docs/AGENTS.md.  
+> The current system already supports repo cloning and multi-agent analysis.  
+> We are now implementing the “Repository Intelligence + Analysis Limits + Artifact UX” milestone from next_step.md.  
+> Start with artifact links in the UI and backend `/api/artifacts` endpoint, then add tests.
