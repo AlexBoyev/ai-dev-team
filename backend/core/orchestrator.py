@@ -51,9 +51,9 @@ def _build_agents() -> Dict[str, Any]:
 
 def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(task.payload)
-    repo_path = artifacts.get("repo_path", "")
+    repo_path = str(artifacts.get("repo_path", "")).strip()
 
-    if task.task_type in (
+    if task.task_type in {
         "inventory_workspace",
         "select_key_files",
         "summarize_key_files",
@@ -61,7 +61,7 @@ def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, An
         "build_qa_findings",
         "review_outputs",
         "write_artifacts",
-    ):
+    }:
         payload["target_subdir"] = repo_path
 
     if task.task_type == "select_key_files":
@@ -71,7 +71,9 @@ def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, An
         payload["selected_files"] = artifacts.get("selected_files", [])
 
     elif task.task_type == "build_qa_findings":
+        payload["workspace_files"] = artifacts.get("workspace_files", [])
         payload["workspace_metadata"] = artifacts.get("workspace_metadata", [])
+        payload["selected_files"] = artifacts.get("selected_files", [])
         payload["report_md"] = artifacts.get("report_md", "")
 
     elif task.task_type == "review_outputs":
@@ -109,7 +111,7 @@ def demo_run(repo_url: str | None = None) -> None:
         add_log(
             "INFO",
             "orchestrator",
-            f"Run started | run_id={run_id} | workspace={workspace_root} | repo_url={repo_url or '(default)'}",
+            f"Run started | run_id={run_id} | workspace={workspace_root} | repo_url={repo_url or '[missing]'}",
         )
         snapshot_run(snapshot_for_api(), run_id, note="run_started")
 
@@ -119,7 +121,9 @@ def demo_run(repo_url: str | None = None) -> None:
             current_task_id=None,
             last_action="Building task plan",
         )
+
         plan = manager.build_plan(repo_url=repo_url)
+
         update_agent(
             "manager",
             status="idle",
@@ -133,6 +137,7 @@ def demo_run(repo_url: str | None = None) -> None:
 
             upsert_task(task)
             update_task(task.id, status="in_progress")
+
             update_agent(
                 planned.assigned_agent,
                 status="working",
@@ -148,13 +153,20 @@ def demo_run(repo_url: str | None = None) -> None:
                     artifacts[key] = value
 
             result_message = str(result.get("result_message", "Done"))
-            update_task(task.id, status="completed", result=result_message)
+
+            update_task(
+                task.id,
+                status="completed",
+                result=result_message,
+            )
+
             update_agent(
                 planned.assigned_agent,
                 status="idle",
                 current_task_id=None,
                 last_action=result_message,
             )
+
             add_log(
                 "INFO",
                 "orchestrator",
@@ -175,7 +187,11 @@ def demo_run(repo_url: str | None = None) -> None:
 
         for agent_key in ["manager", "dev_1", "qa_1", "reviewer", "devops"]:
             try:
-                update_agent(agent_key, status="idle", current_task_id=None)
+                update_agent(
+                    agent_key,
+                    status="idle",
+                    current_task_id=None,
+                )
             except Exception:
                 pass
 
