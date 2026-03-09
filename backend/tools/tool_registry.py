@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List
-import subprocess
+from urllib.parse import urlparse
+
 from backend.services.scanner_service import build_markdown_report, scan_directory
 from backend.tools.file_tools import write_text
 
@@ -27,6 +29,23 @@ class ToolSpec:
 
 _REGISTRY: Dict[str, ToolSpec] = {}
 
+IGNORED_DIR_NAMES = {
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+    "coverage",
+    "out",
+    "target",
+    "bin",
+    "obj",
+}
+
 
 def register_tool(name: str, description: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     def _decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -45,20 +64,48 @@ def list_tools() -> Dict[str, str]:
 def _ensure_within_workspace(ctx: ToolContext, path: Path) -> Path:
     root = ctx.workspace_root.resolve()
     resolved = path.resolve()
+
     if resolved == root or root in resolved.parents:
         return resolved
+
     raise ToolError(f"Path escapes workspace: {path}")
 
 
 def _resolve_target_dir(ctx: ToolContext, relative_dir: str = "") -> Path:
     if not relative_dir:
         return ctx.workspace_root.resolve()
+
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_dir)
     if not target.exists():
         raise ToolError(f"Target directory does not exist: {relative_dir}")
     if not target.is_dir():
         raise ToolError(f"Target is not a directory: {relative_dir}")
     return target
+
+
+def _extract_repo_name(repo_url: str) -> str:
+    parsed = urlparse(repo_url)
+    path = parsed.path.rstrip("/")
+
+    if not path:
+        raise ToolError(f"Invalid repository URL: {repo_url}")
+
+    repo_name = path.split("/")[-1]
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+
+    if not repo_name:
+        raise ToolError(f"Could not extract repository name from URL: {repo_url}")
+
+    if any(sep in repo_name for sep in ("/", "\\", "..")):
+        raise ToolError(f"Unsafe repository name extracted from URL: {repo_url}")
+
+    return repo_name
+
+
+def _is_in_ignored_dir(base_dir: Path, path: Path) -> bool:
+    relative_parts = path.relative_to(base_dir).parts
+    return any(part in IGNORED_DIR_NAMES for part in relative_parts)
 
 
 def run_tool(tool_name: str, ctx: ToolContext, **kwargs: Any) -> Any:
@@ -112,9 +159,16 @@ def tool_write_workspace_json(ctx: ToolContext, relative_path: str, data: object
 def tool_list_workspace_files_in_dir(ctx: ToolContext, relative_dir: str = "") -> List[str]:
     target_dir = _resolve_target_dir(ctx, relative_dir)
     files: List[str] = []
+
     for path in target_dir.rglob("*"):
-        if path.is_file():
-            files.append(str(path.relative_to(ctx.workspace_root)).replace("\\", "/"))
+        if not path.is_file():
+            continue
+
+        if _is_in_ignored_dir(target_dir, path):
+            continue
+
+        files.append(str(path.relative_to(ctx.workspace_root)).replace("\\", "/"))
+
     return sorted(files)
 
 
@@ -130,9 +184,16 @@ def tool_get_workspace_file_metadata(ctx: ToolContext, relative_dir: str = "") -
         if not path.is_file():
             continue
 
+        if _is_in_ignored_dir(target_dir, path):
+            continue
+
         rel_path = str(path.relative_to(ctx.workspace_root)).replace("\\", "/")
         suffix = path.suffix.lower()
-        size = path.stat().st_size
+
+        try:
+            size = path.stat().st_size
+        except OSError as e:
+            raise ToolError(f"Failed to stat file: {rel_path} | error={e}") from e
 
         items.append(
             {
@@ -153,7 +214,18 @@ def tool_get_workspace_file_metadata(ctx: ToolContext, relative_dir: str = "") -
 )
 def tool_read_workspace_file(ctx: ToolContext, relative_path: str) -> str:
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_path)
-    return target.read_text(encoding="utf-8")
+
+    if not target.exists():
+        raise ToolError(f"Workspace file does not exist: {relative_path}")
+    if not target.is_file():
+        raise ToolError(f"Workspace path is not a file: {relative_path}")
+
+    try:
+        return target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as e:
+        raise ToolError(f"File is not valid UTF-8 text: {relative_path}") from e
+    except Exception as e:
+        raise ToolError(f"Failed to read workspace file: {relative_path} | error={e}") from e
 
 
 @register_tool(
@@ -166,6 +238,9 @@ def tool_search_workspace_text(ctx: ToolContext, pattern: str, relative_dir: str
 
     for path in target_dir.rglob("*"):
         if not path.is_file():
+            continue
+
+        if _is_in_ignored_dir(target_dir, path):
             continue
 
         try:
@@ -191,18 +266,42 @@ def tool_search_workspace_text(ctx: ToolContext, pattern: str, relative_dir: str
     description="Clone a git repository into workspace/repos.",
 )
 def tool_clone_git_repo(ctx: ToolContext, repo_url: str) -> str:
-    repos_dir = ctx.workspace_root / "repos"
-    repos_dir.mkdir(exist_ok=True)
+    repo_url = (repo_url or "").strip()
+    if not repo_url:
+        raise ToolError("repo_url is required")
 
-    repo_name = repo_url.rstrip("/").split("/")[-1].replace(".git", "")
-    target_dir = repos_dir / repo_name
+    repos_dir = _ensure_within_workspace(ctx, ctx.workspace_root / "repos")
+    repos_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_name = _extract_repo_name(repo_url)
+    target_dir = _ensure_within_workspace(ctx, repos_dir / repo_name)
 
     if target_dir.exists():
-        return str(target_dir)
+        if not target_dir.is_dir():
+            raise ToolError(f"Clone target exists and is not a directory: {target_dir}")
+        return str(target_dir.relative_to(ctx.workspace_root)).replace("\\", "/")
 
-    subprocess.run(
-        ["git", "clone", "--depth", "1", repo_url, str(target_dir)],
-        check=True,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", "clone", "--depth", "1", repo_url, str(target_dir)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as e:
+        raise ToolError(f"git clone failed to start: {e}") from e
 
-    return str(target_dir.relative_to(ctx.workspace_root))
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        details = stderr or stdout or "unknown git error"
+
+        if target_dir.exists() and not any(target_dir.iterdir()):
+            try:
+                target_dir.rmdir()
+            except OSError:
+                pass
+
+        raise ToolError(f"git clone failed for {repo_url}: {details}")
+
+    return str(target_dir.relative_to(ctx.workspace_root)).replace("\\", "/")

@@ -41,7 +41,7 @@ function renderAgents(agents) {
 
 function renderTasks(tasks) {
   const tbody = document.querySelector("#tasksTable tbody");
-  const sorted = [...tasks].sort((a,b) => a.id.localeCompare(b.id));
+  const sorted = [...tasks].sort((a, b) => a.id.localeCompare(b.id));
   tbody.innerHTML = sorted.map(t => `
     <tr>
       <td>${t.id}</td>
@@ -66,13 +66,15 @@ function renderLogs(logs) {
 }
 
 function countTaskStatuses(tasks) {
-  const c = { pending:0, in_progress:0, completed:0, failed:0, rejected:0 };
-  for (const t of tasks) c[t.status] = (c[t.status] ?? 0) + 1;
+  const c = { pending: 0, in_progress: 0, completed: 0, failed: 0, rejected: 0 };
+  for (const t of tasks) {
+    c[t.status] = (c[t.status] ?? 0) + 1;
+  }
   return c;
 }
 
 function ensureChart(ctx, counts) {
-  const labels = ["pending","in_progress","completed","failed","rejected"];
+  const labels = ["pending", "in_progress", "completed", "failed", "rejected"];
   const data = labels.map(k => counts[k] ?? 0);
 
   if (!chart) {
@@ -114,7 +116,19 @@ async function refresh() {
 }
 
 async function runDemo() {
-  await fetch("/api/run", { method: "POST" });
+  const repoUrlInput = document.getElementById("repo-url-input");
+  const repo_url = repoUrlInput ? repoUrlInput.value.trim() : "";
+
+  if (!repo_url) {
+    alert("Please enter a GitHub repository URL.");
+    return;
+  }
+
+  await fetch("/api/run", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ repo_url })
+  });
 }
 
 async function resetAll() {

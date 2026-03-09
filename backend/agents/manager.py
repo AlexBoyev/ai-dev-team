@@ -14,7 +14,9 @@ class ManagerAgent:
         repo_url = (repo_url or "").strip()
 
         if not repo_url:
-            repo_url = "https://github.com/tiangolo/fastapi"
+            raise ValueError(
+                "Repository URL is required. Please provide a GitHub repository URL."
+            )
 
         repo_name = self._extract_repo_name(repo_url)
 

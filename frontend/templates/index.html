@@ -16,9 +16,18 @@
         <p class="sub">Live view of agents, tasks, and run logs.</p>
       </div>
 
-      <div class="actions">
-        <button id="runBtn" class="btn primary">Run</button>
-        <button id="resetBtn" class="btn">Reset</button>
+      <div class="actions actions-stack">
+        <input
+          id="repo-url-input"
+          class="repo-input"
+          type="url"
+          placeholder="https://github.com/owner/repo"
+          spellcheck="false"
+        />
+        <div class="action-buttons">
+          <button id="runBtn" class="btn primary">Run</button>
+          <button id="resetBtn" class="btn">Reset</button>
+        </div>
       </div>
     </header>
 

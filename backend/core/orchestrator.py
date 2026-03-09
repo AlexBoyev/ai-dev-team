@@ -11,13 +11,14 @@ from backend.core.memory import (
     add_log,
     get_run_in_progress,
     set_run_in_progress,
+    snapshot_for_api,
     update_agent,
     update_task,
     upsert_task,
 )
+from backend.core.persistence import new_run_id, snapshot_run
 from backend.core.tasks import PlannedTask
 from backend.tools.tool_registry import ToolContext
-
 
 WORKSPACE_ROOT = Path("workspace")
 
@@ -50,6 +51,18 @@ def _build_agents() -> Dict[str, Any]:
 
 def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(task.payload)
+    repo_path = artifacts.get("repo_path", "")
+
+    if task.task_type in (
+        "inventory_workspace",
+        "select_key_files",
+        "summarize_key_files",
+        "scan_and_report",
+        "build_qa_findings",
+        "review_outputs",
+        "write_artifacts",
+    ):
+        payload["target_subdir"] = repo_path
 
     if task.task_type == "select_key_files":
         payload["workspace_metadata"] = artifacts.get("workspace_metadata", [])
@@ -74,38 +87,31 @@ def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, An
         payload["qa_findings_md"] = artifacts.get("qa_findings_md", "")
         payload["review_md"] = artifacts.get("review_md", "")
 
-    elif task.task_type in (
-            "inventory_workspace",
-            "select_key_files",
-            "summarize_key_files",
-            "scan_and_report",
-            "build_qa_findings",
-    ):
-        payload["target_subdir"] = artifacts.get("repo_path", "")
-
     return payload
 
 
-def demo_run() -> None:
+def demo_run(repo_url: str | None = None) -> None:
     if get_run_in_progress():
         add_log("INFO", "orchestrator", "Run request ignored: run already in progress.")
         return
 
     set_run_in_progress(True)
-    run_id = str(uuid.uuid4())
+
+    run_id = new_run_id()
     workspace_root = _ensure_workspace()
     ctx = ToolContext(workspace_root=workspace_root)
-
     artifacts: Dict[str, Any] = {}
     agents = _build_agents()
     manager = agents["manager"]
+    current_task_id: str | None = None
 
     try:
         add_log(
             "INFO",
             "orchestrator",
-            f"Run started | run_id={run_id} | workspace={workspace_root}",
+            f"Run started | run_id={run_id} | workspace={workspace_root} | repo_url={repo_url or '(default)'}",
         )
+        snapshot_run(snapshot_for_api(), run_id, note="run_started")
 
         update_agent(
             "manager",
@@ -113,7 +119,7 @@ def demo_run() -> None:
             current_task_id=None,
             last_action="Building task plan",
         )
-        plan = manager.build_plan()
+        plan = manager.build_plan(repo_url=repo_url)
         update_agent(
             "manager",
             status="idle",
@@ -123,8 +129,9 @@ def demo_run() -> None:
 
         for planned in plan:
             task = _new_task(planned.title, planned.assigned_agent)
-            upsert_task(task)
+            current_task_id = task.id
 
+            upsert_task(task)
             update_task(task.id, status="in_progress")
             update_agent(
                 planned.assigned_agent,
@@ -141,7 +148,6 @@ def demo_run() -> None:
                     artifacts[key] = value
 
             result_message = str(result.get("result_message", "Done"))
-
             update_task(task.id, status="completed", result=result_message)
             update_agent(
                 planned.assigned_agent,
@@ -149,7 +155,6 @@ def demo_run() -> None:
                 current_task_id=None,
                 last_action=result_message,
             )
-
             add_log(
                 "INFO",
                 "orchestrator",
@@ -157,9 +162,16 @@ def demo_run() -> None:
             )
 
         add_log("INFO", "orchestrator", f"Run finished | run_id={run_id}")
+        snapshot_run(snapshot_for_api(), run_id, note="run_finished")
 
     except Exception as e:
         add_log("ERROR", "orchestrator", f"Run failed | run_id={run_id} | error={e}")
+
+        if current_task_id:
+            try:
+                update_task(current_task_id, status="failed", result=str(e))
+            except Exception:
+                pass
 
         for agent_key in ["manager", "dev_1", "qa_1", "reviewer", "devops"]:
             try:
@@ -167,6 +179,7 @@ def demo_run() -> None:
             except Exception:
                 pass
 
+        snapshot_run(snapshot_for_api(), run_id, note="run_failed")
         raise
 
     finally:
