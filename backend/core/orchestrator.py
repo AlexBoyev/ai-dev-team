@@ -3,114 +3,201 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+from backend.agents import DeveloperAgent, DevOpsAgent, QaAgent
 from backend.core.memory import (
+    TaskState,
     add_log,
     get_run_in_progress,
     set_run_in_progress,
+    snapshot_state,
     update_agent,
     update_task,
     upsert_task,
-    TaskState,
-    snapshot_state,
 )
-
-from backend.core.persistence import new_run_id, snapshot_run
-from backend.services.scanner_service import scan_directory, build_markdown_report
-from backend.services.insights_service import analyze_workspace, append_insights_to_report
-from backend.tools.file_tools import write_text
+from backend.tools.tool_registry import ToolContext
 
 
 WORKSPACE_ROOT = Path("workspace")
-REPORT_PATH = WORKSPACE_ROOT / "reports" / "latest_report.md"
+
+
+def _ensure_workspace() -> Path:
+    root = WORKSPACE_ROOT.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _new_task(title: str, assigned_agent: str) -> TaskState:
+    return TaskState(
+        id=str(uuid.uuid4())[:8],
+        title=title,
+        status="pending",
+        assigned_agent=assigned_agent,
+        result=None,
+    )
 
 
 def demo_run() -> None:
     if get_run_in_progress():
+        add_log("INFO", "orchestrator", "Run request ignored: run already in progress.")
         return
 
-    run_id = new_run_id()
     set_run_in_progress(True)
+    run_id = str(uuid.uuid4())
+    workspace_root = _ensure_workspace()
+    ctx = ToolContext(workspace_root=workspace_root)
+
+    dev = DeveloperAgent(agent_id="dev_1")
+    qa = QaAgent(agent_id="qa_1")
+    devops = DevOpsAgent(agent_id="devops")
 
     try:
-        add_log("INFO", "orchestrator", f"Run {run_id} started.")
-        snapshot_run(snapshot_state(), run_id, note="run start")
+        add_log(
+            "INFO",
+            "orchestrator",
+            f"Run started | run_id={run_id} | workspace={workspace_root}",
+        )
 
-        WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+        update_agent(
+            "dev_1",
+            status="idle",
+            current_task_id=None,
+            last_action=None,
+        )
+        update_agent(
+            "qa_1",
+            status="idle",
+            current_task_id=None,
+            last_action=None,
+        )
+        update_agent(
+            "devops",
+            status="idle",
+            current_task_id=None,
+            last_action=None,
+        )
 
-        # -------------------------
-        # Task 1: Scan workspace
-        # -------------------------
-        t_scan = str(uuid.uuid4())[:8]
-        upsert_task(TaskState(
-            id=t_scan,
-            title="Scan workspace directory",
-            status="pending",
-            assigned_agent="dev_1"
-        ))
+        # ---------------------------
+        # Task 1: developer scan/report
+        # ---------------------------
+        t1 = _new_task(
+            "Analyze workspace for TODO/FIXME + suspicious strings + large files",
+            "dev_1",
+        )
+        upsert_task(t1)
 
-        update_task(t_scan, status="in_progress")
-        update_agent("dev_1", status="working", current_task_id=t_scan, last_action="Scanning workspace")
-        add_log("INFO", "dev_1", f"Task {t_scan}: scanning `{WORKSPACE_ROOT}` ...")
+        update_task(t1.id, status="in_progress")
+        update_agent("dev_1", status="working", current_task_id=t1.id)
 
-        scan = scan_directory(WORKSPACE_ROOT)
+        scan_out = dev.run_task("scan", ctx)
+        scan_result = scan_out["scan_result"]
 
-        scan_summary = f"files={scan.total_files}, dirs={scan.total_dirs}, py={scan.python_files}"
-        update_task(t_scan, status="completed", result=scan_summary)
-        update_agent("dev_1", status="idle", current_task_id=None, last_action="Scan complete")
-        add_log("INFO", "dev_1", f"Task {t_scan} completed: {scan_summary}")
+        report_out = dev.run_task("build_report", ctx, {"scan_result": scan_result})
+        report_md = report_out["report_md"]
 
-        # -------------------------
-        # Task 2: Write base report
-        # -------------------------
-        t_report = str(uuid.uuid4())[:8]
-        upsert_task(TaskState(
-            id=t_report,
-            title="Write scan report to workspace/reports/latest_report.md",
-            status="pending",
-            assigned_agent="devops"
-        ))
+        update_task(t1.id, status="completed", result="Scan complete")
+        update_agent(
+            "dev_1",
+            status="idle",
+            current_task_id=None,
+            last_action="Scan complete",
+        )
+        add_log(
+            "INFO",
+            "orchestrator",
+            f"Developer scan/report completed | task_id={t1.id}",
+        )
 
-        update_task(t_report, status="in_progress")
-        update_agent("devops", status="working", current_task_id=t_report, last_action="Writing report")
-        add_log("INFO", "devops", f"Task {t_report}: writing report to `{REPORT_PATH}` ...")
+        # ---------------------------
+        # Task 2: QA insights
+        # ---------------------------
+        t2 = _new_task("Generate insights summary", "qa_1")
+        upsert_task(t2)
 
-        report_md = build_markdown_report(scan)
-        write_text(REPORT_PATH, report_md)
+        update_task(t2.id, status="in_progress")
+        update_agent("qa_1", status="working", current_task_id=t2.id)
 
-        update_task(t_report, status="completed", result=f"Wrote {REPORT_PATH.as_posix()}")
-        update_agent("devops", status="idle", current_task_id=None, last_action="Report written")
-        add_log("INFO", "devops", f"Task {t_report} completed: report saved.")
+        insights_out = qa.run_task("insights", ctx)
+        insights = insights_out["insights"]
 
-        # -------------------------
-        # Task 3: Insights analysis
-        # -------------------------
-        t_insights = str(uuid.uuid4())[:8]
-        upsert_task(TaskState(
-            id=t_insights,
-            title="Analyze workspace for TODO/FIXME + suspicious strings + large files",
-            status="pending",
-            assigned_agent="qa_1"
-        ))
+        report_out2 = qa.run_task(
+            "append_insights",
+            ctx,
+            {"report_md": report_md, "insights": insights},
+        )
+        report_md = report_out2["report_md"]
 
-        update_task(t_insights, status="in_progress")
-        update_agent("qa_1", status="working", current_task_id=t_insights, last_action="Analyzing content")
-        add_log("INFO", "qa_1", f"Task {t_insights}: analyzing `{WORKSPACE_ROOT}` for insights...")
+        update_task(t2.id, status="completed", result="Insights complete")
+        update_agent(
+            "qa_1",
+            status="idle",
+            current_task_id=None,
+            last_action="Insights complete",
+        )
+        add_log(
+            "INFO",
+            "orchestrator",
+            f"QA insights completed | task_id={t2.id}",
+        )
 
-        insights = analyze_workspace(WORKSPACE_ROOT)
-        updated_report = append_insights_to_report(report_md, insights)
-        write_text(REPORT_PATH, updated_report)
+        # ---------------------------
+        # Task 3: DevOps write report
+        # ---------------------------
+        t3 = _new_task("Write report to workspace and persist snapshot", "devops")
+        upsert_task(t3)
 
-        insights_summary = f"todo_hits={insights.todo_hits}, suspicious_hits={insights.suspicious_hits}"
-        update_task(t_insights, status="completed", result=insights_summary)
-        update_agent("qa_1", status="idle", current_task_id=None, last_action="Insights complete")
-        add_log("INFO", "qa_1", f"Task {t_insights} completed: {insights_summary}. Report updated.")
+        update_task(t3.id, status="in_progress")
+        update_agent("devops", status="working", current_task_id=t3.id)
 
-        add_log("INFO", "orchestrator", f"Run {run_id} finished successfully.")
-        snapshot_run(snapshot_state(), run_id, note="run end")
+        devops_out = devops.run_task("write_report", ctx, {"report_md": report_md})
+        written_file = devops_out.get("written", "workspace/report.md")
+
+        update_task(t3.id, status="completed", result=written_file)
+        update_agent(
+            "devops",
+            status="idle",
+            current_task_id=None,
+            last_action="Report written",
+        )
+        add_log(
+            "INFO",
+            "orchestrator",
+            f"DevOps write completed | task_id={t3.id} | file={written_file}",
+        )
+
+        snapshot_state()
+
+        add_log(
+            "INFO",
+            "orchestrator",
+            f"Run finished | run_id={run_id}",
+        )
 
     except Exception as e:
-        add_log("ERROR", "orchestrator", f"Run {run_id} failed: {e}")
-        snapshot_run(snapshot_state(), run_id, note="run failed")
+        add_log(
+            "ERROR",
+            "orchestrator",
+            f"Run failed | run_id={run_id} | error={e}",
+        )
+
+        # Best effort recovery for UI state
+        try:
+            update_agent("dev_1", status="idle", current_task_id=None)
+            update_agent("qa_1", status="idle", current_task_id=None)
+            update_agent("devops", status="idle", current_task_id=None)
+        except Exception:
+            pass
+
+        # Mark any in-progress tasks as failed
+        try:
+            for task_id in ["t1", "t2", "t3"]:
+                if task_id in locals():
+                    task_obj = locals()[task_id]
+                    if task_obj is not None:
+                        update_task(task_obj.id, status="failed", result=str(e))
+        except Exception:
+            pass
+
+        raise
 
     finally:
         set_run_in_progress(False)
