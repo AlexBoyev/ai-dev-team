@@ -26,9 +26,45 @@ class RunRequest(BaseModel):
     repo_url: str | None = None
 
 
-@router.get("/", response_class=HTMLResponse)
-def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+@router.get("/api/tasks/{run_id}")
+def api_tasks(run_id: str, db: Session = Depends(get_db)):
+    tasks = (
+        db.query(Task)
+        .filter(Task.run_id == run_id)
+        .order_by(Task.created_at)
+        .all()
+    )
+    return JSONResponse([
+        {
+            "id": str(t.id),
+            "title": t.title,
+            "task_type": t.task_type if hasattr(t, "task_type") else "",
+            "status": t.status,
+            "assigned_agent": t.assigned_agent,
+            "result": t.result,
+        }
+        for t in tasks
+    ])
+
+
+@router.get("/api/logs/{run_id}")
+def api_logs(run_id: str, db: Session = Depends(get_db)):
+    logs = (
+        db.query(Log)
+        .filter(Log.run_id == run_id)
+        .order_by(Log.ts.asc())
+        .limit(500)
+        .all()
+    )
+    return JSONResponse([
+        {
+            "ts": l.ts.timestamp(),
+            "level": l.level,
+            "source": l.source,
+            "message": l.message,
+        }
+        for l in logs
+    ])
 
 
 @router.get("/api/state")
@@ -208,7 +244,6 @@ def api_repos(db: Session = Depends(get_db)):
 
 @router.delete("/api/repos/{repo_id}")
 def api_delete_repo(repo_id: str, db: Session = Depends(get_db)):
-    """Delete repo from disk and DB."""
     repo = db.query(Repository).filter(Repository.id == repo_id).first()
     if not repo:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -218,9 +253,37 @@ def api_delete_repo(repo_id: str, db: Session = Depends(get_db)):
     if path.exists():
         shutil.rmtree(path)
 
+    # Find all runs for this repo URL
+    run_ids_to_clean = [
+        str(r.id) for r in
+        db.query(Run).filter(Run.repo_url == repo.url).all()
+    ]
+
+    # ── Must null FK before deleting runs ───────────────────────
+    repo.last_run_id = None
+    db.commit()
+
+    # Now safe to delete runs and all dependent rows
+    for rid in run_ids_to_clean:
+        db.query(Artifact).filter(Artifact.run_id == rid).delete()
+        db.query(Log).filter(Log.run_id == rid).delete()
+        db.query(Task).filter(Task.run_id == rid).delete()
+        db.query(AgentEvent).filter(AgentEvent.run_id == rid).delete()
+        db.query(Run).filter(Run.id == rid).delete()
+
+        # Delete run artifact folder from disk
+        run_artifact_path = Path("workspace") / "runs" / rid
+        if run_artifact_path.exists():
+            shutil.rmtree(run_artifact_path)
+
+    db.commit()
+
     db.delete(repo)
     db.commit()
+
     return JSONResponse({"ok": True, "deleted": repo.name})
+
+
 
 
 @router.get("/api/repos/{repo_id}/download")

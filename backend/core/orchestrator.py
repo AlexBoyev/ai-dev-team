@@ -35,6 +35,13 @@ def _ensure_workspace() -> Path:
     return root
 
 
+def _run_artifact_dir(workspace_root: Path, run_id: str) -> Path:
+    """Each run gets its own artifact folder so runs never overwrite each other."""
+    d = workspace_root / "runs" / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _add_log(db, run_id: str, level: str, source: str, message: str) -> None:
     db.add(Log(
         run_id=run_id,
@@ -106,6 +113,8 @@ def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, An
         payload["code_summary_md"]  = artifacts.get("code_summary_md", "")
         payload["qa_findings_md"]   = artifacts.get("qa_findings_md", "")
         payload["review_md"]        = artifacts.get("review_md", "")
+        # Tell the agent WHERE to write files this run
+        payload["artifact_dir"]     = str(artifacts.get("artifact_dir", ""))
 
     return payload
 
@@ -113,21 +122,29 @@ def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, An
 def _register_repo(
     db,
     run_id: str,
+    repo_url: str,
     artifacts: Dict[str, Any],
     workspace_root: Path,
 ) -> None:
-    """
-    Called after clone_git_repo task completes.
-    Inserts or updates a Repository row in the DB.
-    """
-    repo_path_rel = artifacts.get("repo_path", "")
+    repo_path_rel = (
+        artifacts.get("repo_path")
+        or artifacts.get("cloned_path")
+        or artifacts.get("path")
+        or artifacts.get("result_path")
+        or ""
+    )
+    repo_path_rel = str(repo_path_rel).strip()
+
+    if not repo_path_rel and repo_url:
+        repo_name = repo_url.rstrip("/").split("/")[-1]
+        repo_path_rel = f"repos/{repo_name}"
+
     if not repo_path_rel:
         return
 
     full_path = workspace_root / repo_path_rel
     name = full_path.name
 
-    # Calculate total disk usage (exclude .git)
     disk_bytes = 0
     if full_path.exists():
         disk_bytes = sum(
@@ -144,7 +161,7 @@ def _register_repo(
     else:
         db.add(Repository(
             name=name,
-            url=artifacts.get("repo_url", ""),
+            url=repo_url,
             local_path=str(full_path),
             disk_bytes=disk_bytes,
             last_run_id=run_id,
@@ -158,15 +175,14 @@ def _register_repo(
 def _register_artifacts(
     db,
     run_id: str,
-    workspace_root: Path,
+    artifact_dir: Path,
 ) -> None:
     """
-    Called after write_artifacts task completes.
-    Inserts an Artifact row for each output file that exists on disk.
-    Skips files already registered for this run.
+    Register output files from the run-specific artifact_dir.
+    Each run writes to workspace/runs/{run_id}/ so files never collide.
     """
     for name in ARTIFACT_FILES:
-        path = workspace_root / name
+        path = artifact_dir / name
         if not path.exists():
             continue
 
@@ -193,8 +209,11 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
 
     try:
         workspace_root  = _ensure_workspace()
+        artifact_dir    = _run_artifact_dir(workspace_root, run_id)
         ctx             = ToolContext(workspace_root=workspace_root)
-        artifacts: Dict[str, Any] = {}
+        artifacts: Dict[str, Any] = {
+            "artifact_dir": str(artifact_dir),  # available to all tasks via _build_payload
+        }
         agents          = _build_agents()
         manager         = agents["manager"]
         current_task_db_id: str | None = None
@@ -210,7 +229,6 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
         # ── Execute each planned task ────────────────────────────────────
         for planned in plan:
 
-            # Create task row
             task_db_id         = str(uuid.uuid4())
             current_task_db_id = task_db_id
 
@@ -227,7 +245,6 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
             db.add(task_row)
             db.commit()
 
-            # Mark in_progress
             task_row.status     = "in_progress"
             task_row.updated_at = utcnow()
             db.commit()
@@ -235,19 +252,16 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
             _update_agent(db, run_id, planned.assigned_agent,
                           "working", f"Starting: {planned.title}")
 
-            # Run the agent
             payload = _build_payload(planned, artifacts)
             agent   = agents[planned.assigned_agent]
             result  = agent.run_task(planned.task_type, ctx, payload)
 
-            # Pass results forward to downstream tasks
             for key, value in result.items():
                 if key != "result_message":
                     artifacts[key] = value
 
             result_message = str(result.get("result_message", "Done"))
 
-            # Mark completed
             task_row.status     = "completed"
             task_row.result     = result_message
             task_row.updated_at = utcnow()
@@ -260,13 +274,14 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
 
             # ── Post-task hooks ──────────────────────────────────────────
 
-            # After clone: register repo in DB
-            if planned.task_type == "clone_git_repo":
-                _register_repo(db, run_id, artifacts, workspace_root)
+            if planned.task_type == "clone_repository":
+                _add_log(db, run_id, "INFO", "orchestrator",
+                         f"Clone result keys: {list(result.keys())} | "
+                         f"values: {dict(list(result.items())[:5])}")
+                _register_repo(db, run_id, repo_url or "", artifacts, workspace_root)
 
-            # After write_artifacts: register output files in DB
             if planned.task_type == "write_artifacts":
-                _register_artifacts(db, run_id, workspace_root)
+                _register_artifacts(db, run_id, artifact_dir)
 
         # ── Mark run completed ───────────────────────────────────────────
         run_row = db.query(Run).filter(Run.id == run_id).first()
@@ -282,7 +297,6 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
         _add_log(db, run_id, "ERROR", "orchestrator",
                  f"Run failed | run_id={run_id} | error={e}")
 
-        # Mark current task failed
         if current_task_db_id:
             try:
                 t = db.query(Task).filter(Task.id == current_task_db_id).first()
@@ -294,7 +308,6 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
             except Exception:
                 pass
 
-        # Mark run failed
         try:
             run_row = db.query(Run).filter(Run.id == run_id).first()
             if run_row:

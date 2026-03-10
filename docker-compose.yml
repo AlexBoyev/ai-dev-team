@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
 
   postgres:
@@ -26,11 +24,11 @@ services:
       timeout: 3s
       retries: 10
 
-  app:
-    build: .
+  backend:                          # ← renamed from app
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "8010:8010"
     env_file: .env
     environment:
       DATABASE_URL: postgresql://aiuser:aipass@postgres:5432/aidevteam
@@ -56,7 +54,9 @@ services:
       start_period: 15s
 
   worker:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
     environment:
@@ -75,6 +75,17 @@ services:
       --loglevel=info
       --concurrency=2
       --queues=pipeline
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:                      # ← renamed from app
+        condition: service_healthy
 
 volumes:
   pgdata:
