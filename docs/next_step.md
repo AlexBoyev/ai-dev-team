@@ -1,203 +1,83 @@
-# Next Steps — AI Dev Team
+# next_step.md — AI Dev Team
 
-## Status
-Pipeline is stable. Multi-repo support working. Per-run artifact isolation done.
-UI is clean — tasks, logs, artifacts load correctly per repo.
+Last updated: 2026-03-11
+Status: Phase 3 done. Phase 4 blocked — need agent source files.
 
 ---
 
-## Step 1 — Live Polling During Runs (Frontend)
+## ✅ Phase 1 — Core Pipeline (DONE)
+## ✅ Phase 2 — UI & Live Polling (DONE)
+## ✅ Phase 3 — Cost Tracking + Prompt Versioning (DONE)
+- Prompt YAMLs created: developer_scan.yaml, developer_summarize.yaml,
+  qa_findings.yaml, reviewer.yaml
+- PromptLoader built (backend/core/prompt_loader.py)
+- Agents DO NOT use prompts yet — still rule-based
 
-**Problem:** TaskTable and LogViewer fetch once on mount. During an active run
-you see nothing until you manually refresh.
+---
 
-**Fix:** When `run_in_progress=true`, poll TaskTable and LogViewer every 2-3s.
-Stop polling when run completes.
+## 🔴 Phase 4 — LLM Integration (CURRENT)
 
-### Files to change
-- `frontend/src/components/TaskTable.tsx`
-  - Add `useEffect` interval that polls `fetchTasks(runId)` every 2500ms
-  - Only activate interval when `running=true` prop
-  - Clear interval on unmount or when running stops
-- `frontend/src/components/LogViewer.tsx`
-  - Same pattern — poll `fetchLogs(runId)` every 2500ms during active run
-  - Append new logs, don't replace (avoid flicker)
-- `frontend/src/App.tsx`
-  - Pass `running={state.run_in_progress}` to TaskTable and LogViewer
+### What's needed to start:
+Upload these files in a NEW conversation:
+  1. backend/agents/base_agent.py
+  2. backend/agents/developer_agent.py
+  3. backend/agents/qa_agent.py
+  4. backend/agents/reviewer_agent.py
+  5. backend/agents/devops_agent.py
+  6. backend/core/orchestrator.py
+  7. backend/core/prompt_loader.py   (if not yet shared)
+  8. backend/prompts/*.yaml          (all 4 yamls)
 
-### Props to add
-```tsx
-// TaskTable
-interface Props {
-  runId: string | null;
-  refreshTick: number;
-  running: boolean;   // ← new
-}
+### Steps once files are available:
 
-// LogViewer
-interface Props {
-  runId: string | null;
-  refreshTick: number;
-  running: boolean;   // ← new
-}
-Step 2 — Run Cancellation (Stop Button)
-Problem: No way to stop a running pipeline mid-execution.
-Critical before adding real LLM agents that cost money.
+Step 4.1 — base_agent.py: add _call_llm(prompt_name, context, db, run_id)
+  - Load + render YAML prompt via PromptLoader
+  - Call anthropic.Anthropic().messages.create(model, messages)
+  - Write result to llm_calls table
+  - Return response text string
 
-Fix: Show a Stop button in RepoSelector (next to Run) only when
-running=true. Calls /api/reset which revokes the Celery task.
+Step 4.2 — developer_agent.py
+  - summarize_key_files → use developer_summarize.yaml
+    - ALSO FIX: skip binary files, open with errors="replace"
+    - ALSO FIX: filter out .git/ paths from inventory
+  - scan_and_report     → use developer_scan.yaml
 
-Files to change
-frontend/src/components/RepoSelector.tsx
+Step 4.3 — qa_agent.py
+  - build_qa_findings   → use qa_findings.yaml
 
-Add Stop button next to Run button, visible only when running=true
+Step 4.4 — reviewer_agent.py
+  - review_outputs      → use reviewer.yaml
 
-frontend/src/App.tsx
+Step 4.5 — devops_agent.py
+  - NO changes needed. Keep as-is.
 
-Wire onStop handler that calls postReset() then poll()
+Step 4.6 — orchestrator.py
+  - Pass db + run_id into ToolContext (or agent constructor)
+  - So _call_llm() can write cost rows to DB
 
-backend/api/routes.py
+Step 4.7 — verify end-to-end
+  - Run full pipeline on any repo
+  - Check /api/costs shows tokens + USD per agent
+  - Confirm CostDashboard renders
 
-/api/reset already exists and revokes Celery task — no changes needed
+---
 
-UI pattern
-tsx
-{running ? (
-  <button className="btn btn-danger" onClick={onStop}>
-    <Square size={13} /> Stop
-  </button>
-) : (
-  <button className="btn btn-primary" onClick={onRun}
-    disabled={!repoUrl.trim()}>
-    <Play size={13} /> Run
-  </button>
-)}
-Step 3 — Prompt Versioning
-Problem: All agent prompts are hardcoded strings inside agent Python files.
-Changing a prompt = code change + redeploy.
+## Known Bugs (fix in Phase 4)
 
-Fix: Move prompts to backend/prompts/ as YAML files.
-Load at runtime. Each prompt has name + version + template.
+| Bug | File | Fix |
+|-----|------|-----|
+| UTF-8 crash on binary files | developer_agent.py | open(..., errors="replace"), skip binary extensions |
+| .git/ folder indexed | developer_agent.py | filter paths containing /.git/ |
+| final_summary.md empty sections | devops_agent.py | resolves once LLM output has correct markdown headings |
 
-Structure
-text
-backend/
-  prompts/
-    scan_and_report_v1.yaml
-    summarize_key_files_v1.yaml
-    build_qa_findings_v1.yaml
-    review_outputs_v1.yaml
-YAML format
-text
-name: scan_and_report
-version: 1
-model: gpt-4o
-max_tokens: 2000
-temperature: 0.2
-system: |
-  You are a senior software engineer analyzing a codebase...
-user_template: |
-  Analyze the following files from {repo_name}:
-  {file_contents}
-  Generate a structured report covering...
-Files to create/change
-backend/prompts/ — create folder + YAML files per task
+---
 
-backend/core/prompt_loader.py — loads YAML, renders template with vars
+## Phase 5 — Quality & Reliability (PLANNED)
+- Retry logic on Claude failures (backoff, max 3)
+- Per-run token budget cap
+- Structured output parsing
+- Fallback to rule-based if LLM fails
+- prompt_version column in llm_calls table
 
-Each agent — replace hardcoded strings with prompt_loader.get("scan_and_report")
-
-Step 4 — Cost / Token Tracking
-Problem: No visibility into LLM spend per run or per task.
-
-Fix: Add LLMCall table. Every LLM call logs tokens + cost.
-Show per-run total cost in Run History.
-
-New DB table
-python
-class LLMCall(Base):
-    __tablename__ = "llm_calls"
-    id            = Column(UUID, primary_key=True, default=uuid4)
-    run_id        = Column(String, ForeignKey("runs.id"))
-    task_id       = Column(String, ForeignKey("tasks.id"))
-    agent_key     = Column(String)
-    model         = Column(String)
-    prompt_tokens = Column(Integer)
-    completion_tokens = Column(Integer)
-    cost_usd      = Column(Numeric(10, 6))
-    ts            = Column(DateTime)
-Files to create/change
-backend/db/models.py — add LLMCall model
-
-backend/core/llm_client.py — wrapper around OpenAI/Anthropic that logs
-every call to LLMCall table automatically
-
-backend/api/routes.py — add /api/runs/{run_id}/cost endpoint
-
-frontend/src/components/RunHistory.tsx — show cost column
-
-New Alembic migration
-
-Step 5 — First Real Agent
-Start with: DeveloperAgent → scan_and_report task only.
-
-Replace the rule-based report builder with a single GPT-4o call.
-Use prompt from prompts/scan_and_report_v1.yaml.
-Log tokens to LLMCall table.
-Validate output quality before converting other agents.
-
-Files to change
-backend/agents/developer_agent.py
-
-scan_and_report task: read selected files → call llm_client.complete()
-→ return structured markdown report
-
-backend/core/llm_client.py — must exist from Step 4
-
-Current Service Names (docker compose)
-backend — FastAPI + Alembic
-
-frontend — React + Nginx
-
-worker — Celery
-
-postgres — DB
-
-redis — Broker
-
-Rebuild Commands
-powershell
-docker compose up --build -d backend worker   # Python changes
-docker compose up --build -d frontend         # React changes
-docker compose up --build -d                  # Everything
-Key File Locations
-text
-backend/
-  agents/
-    developer_agent.py
-    devops_agent.py
-    qa_agent.py
-    reviewer_agent.py
-    manager.py
-  api/
-    routes.py
-  core/
-    orchestrator.py
-    tasks.py
-  db/
-    models.py
-    session.py
-  prompts/          ← create in Step 3
-
-frontend/src/
-  components/
-    TaskTable.tsx
-    LogViewer.tsx
-    ArtifactViewer.tsx
-    RepoSelector.tsx
-    RunHistory.tsx
-    Header.tsx
-  App.tsx
-  api.ts
-  types.ts
-  index.css
+## Phase 6 — Multi-Repo & Scheduling (PLANNED)
+## Phase 7 — Agent Memory & Context (PLANNED)
