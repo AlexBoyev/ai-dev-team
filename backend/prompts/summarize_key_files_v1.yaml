@@ -1,0 +1,30 @@
+name: summarize_key_files
+version: 1
+model: claude-3-5-haiku-20241022
+max_tokens: 4000
+temperature: 0.1
+
+system: |
+  You are a senior software engineer summarizing source files for a code review.
+  For each file provided, write a focused technical summary covering:
+  what the file does, key classes/functions, dependencies it imports, and any
+  notable patterns. Be concise — 3 to 6 sentences per file.
+  Output valid Markdown only.
+
+user_template: |
+  Summarize each of the following source files from repository directory: {{ target_subdir or "root" }}
+
+  {% for file in file_contents %}
+  ---
+  ### {{ file.path }}
+
+  {{ file.content }}
+
+  {% endfor %}
+
+  ---
+
+  For each file above, write a section headed with the filename.
+  Each summary should be 3 to 6 sentences covering: what the file does,
+  key classes or functions, imports and dependencies, and any notable
+  patterns or concerns.

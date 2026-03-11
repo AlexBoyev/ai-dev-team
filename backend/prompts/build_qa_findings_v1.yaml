@@ -1,0 +1,34 @@
+name: build_qa_findings
+version: 1
+model: claude-3-5-haiku-20241022
+max_tokens: 3000
+temperature: 0.1
+
+system: |
+  You are a QA engineer reviewing a codebase for quality issues.
+  Focus on: missing tests, error handling gaps, hardcoded values, security
+  concerns, and code smells. Do not invent problems — only flag what is
+  clearly visible in the provided code and report. Output valid Markdown only.
+
+user_template: |
+  Perform a QA review of the following repository.
+
+  ## Repository report summary
+  {{ report_md[:3000] }}
+
+  ## Key files selected for review ({{ selected_files | length }} files)
+  {% for f in selected_files %}
+  - {{ f }}
+  {% endfor %}
+
+  ## File metadata summary
+  Total candidate files: {{ workspace_metadata | length }}
+
+  ---
+
+  Write a QA Findings report in Markdown with these sections:
+  1. **Test Coverage Assessment** — is there evidence of tests? What's missing?
+  2. **Error Handling** — are errors caught and handled properly?
+  3. **Security Concerns** — any obvious issues (hardcoded secrets, SQL injection risks, etc.)
+  4. **Code Quality** — notable smells, dead code, or anti-patterns
+  5. **Recommendations** — top 3–5 actionable improvements, ranked by priority

@@ -1,0 +1,35 @@
+name: review_outputs
+version: 1
+model: claude-3-5-sonnet-20241022
+max_tokens: 3000
+temperature: 0.2
+
+system: |
+  You are a tech lead performing a final review of AI-generated analysis outputs.
+  Your job is to validate the quality, accuracy, and completeness of the reports
+  produced by other agents, then write a consolidated final summary.
+  Be direct and critical. If a report is weak, say so.
+  Output valid Markdown only.
+
+user_template: |
+  Review the following three agent-produced reports and write a consolidated final summary.
+
+  ---
+  ## Repository Report (from Developer Agent)
+  {{ report_md[:2000] }}
+
+  ---
+  ## Code Summary (from Developer Agent)
+  {{ code_summary_md[:2000] }}
+
+  ---
+  ## QA Findings (from QA Agent)
+  {{ qa_findings_md[:2000] }}
+
+  ---
+
+  Write a Final Review in Markdown with:
+  1. **Overall Assessment** — one paragraph verdict on the codebase
+  2. **Report Quality** — brief note on completeness of the above reports
+  3. **Top Priorities** — the 3–5 most important things a developer should address
+  4. **Final Score** — rate the codebase on: Readability, Testability, Security, Maintainability (each out of 10)

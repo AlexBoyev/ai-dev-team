@@ -1,0 +1,54 @@
+name: scan_and_report
+version: 1
+model: claude-3-5-sonnet-20241022
+max_tokens: 3000
+temperature: 0.2
+
+system: |
+  You are a senior software engineer performing a repository analysis.
+  Your job is to produce a clear, structured technical report about a codebase.
+  Be concise, specific, and actionable. Do not hallucinate files or frameworks
+  that are not explicitly listed in the data provided to you.
+  Output only valid Markdown.
+
+user_template: |
+  Analyze the following repository and produce a structured report.
+
+  ## Repository metadata
+  - Target directory: {{ target_subdir or "root" }}
+  - Project type: {{ project_type }}
+  - Languages detected: {{ languages | join(", ") or "Unknown" }}
+  - Frameworks / tools: {{ frameworks | join(", ") or "None detected" }}
+  - Assets detected: {{ "Yes" if assets_detected else "No" }}
+
+  ## File list (candidate source files, up to 100 shown)
+  {% for f in workspace_files[:100] %}
+  - {{ f }}
+  {% endfor %}
+  {% if workspace_files | length > 100 %}
+  ... and {{ workspace_files | length - 100 }} more files
+  {% endif %}
+
+  ## Important files detected
+  {% for f in important_files %}
+  - {{ f }}
+  {% endfor %}
+
+  ## Entrypoint candidates
+  {% for f in entrypoints %}
+  - {{ f }}
+  {% endfor %}
+
+  ## Run hints (rule-based)
+  {% for h in run_hints %}
+  - {{ h }}
+  {% endfor %}
+
+  ---
+
+  Write a Markdown report with these sections:
+  1. **Project Overview** — what this project is, one paragraph
+  2. **Architecture Summary** — how the code is structured
+  3. **How to Run** — setup and run commands based on the data above
+  4. **Where to Start Reading** — ordered list of files a new developer should read first
+  5. **Key Observations** — anything notable, unusual, or worth flagging
