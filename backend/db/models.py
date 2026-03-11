@@ -30,6 +30,7 @@ class Run(Base):
     logs     = relationship("Log",        back_populates="run", cascade="all, delete-orphan")
     agents   = relationship("AgentEvent", back_populates="run", cascade="all, delete-orphan")
     artifacts = relationship("Artifact",  back_populates="run", cascade="all, delete-orphan")
+    llm_calls = relationship("LLMCall", foreign_keys="LLMCall.run_id", cascade="all, delete-orphan")
 
 
 class Task(Base):
@@ -98,3 +99,20 @@ class Artifact(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
     run = relationship("Run", back_populates="artifacts")
+
+
+from sqlalchemy import Numeric  # add to existing imports
+
+class LLMCall(Base):
+    __tablename__ = "llm_calls"
+
+    id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id            = Column(UUID(as_uuid=True), ForeignKey("runs.id"), nullable=True)
+    task_id           = Column(UUID(as_uuid=True), ForeignKey("tasks.id"), nullable=True)
+    agent_key         = Column(String(64), nullable=True)
+    model             = Column(String(64), nullable=False)
+    prompt_tokens     = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens      = Column(Integer, default=0)
+    cost_usd          = Column(Numeric(10, 6), default=0)
+    ts                = Column(DateTime(timezone=True), default=utcnow)

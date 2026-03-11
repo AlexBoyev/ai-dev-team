@@ -24,7 +24,7 @@ services:
       timeout: 3s
       retries: 10
 
-  backend:                          # ← renamed from app
+  backend:
     build:
       context: .
       dockerfile: Dockerfile
@@ -33,6 +33,9 @@ services:
     environment:
       DATABASE_URL: postgresql://aiuser:aipass@postgres:5432/aidevteam
       REDIS_URL: redis://redis:6379/0
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LLM_BUDGET_USD: ${LLM_BUDGET_USD:-15.00}
+      LLM_BUDGET_PERIOD: ${LLM_BUDGET_PERIOD:-monthly}
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,8 +46,8 @@ services:
       - app_data:/app/data
     command: >
       sh -c "
-        alembic upgrade head &&
-        uvicorn backend.main:app --host 0.0.0.0 --port 8010
+      alembic upgrade head &&
+      uvicorn backend.main:app --host 0.0.0.0 --port 8010
       "
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8010/api/state"]
@@ -62,6 +65,9 @@ services:
     environment:
       DATABASE_URL: postgresql://aiuser:aipass@postgres:5432/aidevteam
       REDIS_URL: redis://redis:6379/0
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LLM_BUDGET_USD: ${LLM_BUDGET_USD:-15.00}
+      LLM_BUDGET_PERIOD: ${LLM_BUDGET_PERIOD:-monthly}
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,7 +90,7 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      backend:                      # ← renamed from app
+      backend:
         condition: service_healthy
 
 volumes:

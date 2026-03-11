@@ -4,8 +4,9 @@ import { fetchLogs } from "../api";
 import type { LogEntry } from "../types";
 
 interface Props {
-  runId: string | null;
+  runId:       string | null;
   refreshTick: number;
+  running:     boolean;
 }
 
 function fmt(ts: number): string {
@@ -20,24 +21,36 @@ const LEVEL_COLORS: Record<string, { bg: string; color: string }> = {
   DEBUG:   { bg: "#f3f4f6", color: "#6b7280" },
 };
 
-export default function LogViewer({ runId, refreshTick }: Props) {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const bottomRef       = useRef<HTMLDivElement>(null);
+export default function LogViewer({ runId, refreshTick, running }: Props) {
+  const [logs, setLogs]  = useState<LogEntry[]>([]);
+  const bottomRef         = useRef<HTMLDivElement>(null);
+  const intervalRef       = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Fetch logs when runId or refreshTick changes
-  useEffect(() => {
+  const load = () => {
     if (!runId) { setLogs([]); return; }
     fetchLogs(runId).then(setLogs);
-  }, [runId, refreshTick]);
+  };
 
-  // Scroll to bottom only when new logs arrive — no smooth to prevent twitch
+  // Fetch on runId / refreshTick change
+  useEffect(() => { load(); }, [runId, refreshTick]);
+
+  // Poll every 2.5s while running
+  useEffect(() => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    if (running && runId) {
+      intervalRef.current = setInterval(load, 2500);
+    }
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+  }, [running, runId]);
+
+  // Scroll to bottom when new lines arrive
   useEffect(() => {
     if (logs.length > 0) {
       bottomRef.current?.scrollIntoView({ behavior: "instant" as ScrollBehavior });
     }
   }, [logs.length]);
 
-  const visible = [...logs].reverse().slice(0, 50);
+  const visible = [...logs].reverse().slice(0, 100);
 
   return (
     <div className="card">
@@ -71,8 +84,7 @@ export default function LogViewer({ runId, refreshTick }: Props) {
                     <td style={{ padding: "5px 6px", whiteSpace: "nowrap" }}>
                       <span style={{ background: badge.bg, color: badge.color,
                                      fontWeight: 600, fontSize: 10, padding: "2px 6px",
-                                     borderRadius: 4, fontFamily: "var(--mono)",
-                                     letterSpacing: "0.03em" }}>
+                                     borderRadius: 4, fontFamily: "var(--mono)" }}>
                         {lvl}
                       </span>
                     </td>

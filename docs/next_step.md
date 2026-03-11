@@ -1,321 +1,203 @@
-# Next Step — Repository Intelligence + Analysis Limits + Artifact UX
+# Next Steps — AI Dev Team
 
-## Current phase
-
-The project already has:
-- FastAPI backend + dashboard UI
-- Run/Reset flow
-- `/api/state` polling
-- orchestrator → agents → tools pipeline
-- repo cloning into `workspace/repos/<repo_name>`
-- artifact generation:
-  - `report.md`
-  - `code_summary.md`
-  - `qa_findings.md`
-  - `review.md`
-  - `final_summary.md`
-
-The next milestone is **not** adding more scaffolding.
-The next milestone is making the analyzer smarter, safer, and easier to consume.
+## Status
+Pipeline is stable. Multi-repo support working. Per-run artifact isolation done.
+UI is clean — tasks, logs, artifacts load correctly per repo.
 
 ---
 
-## Milestone goal
-
-Teach the system to answer:
-
-1. What is this project?
-2. How does it likely run?
-3. Where should I start reading?
-4. Is the repo too large / noisy to analyze fully?
-5. Where can I open the generated artifacts in the UI?
-
----
-
-## Deliverables
-
-By the end of this step, the system should:
-
-- detect likely project type
-- detect languages / frameworks / tools
-- detect likely run/build/test hints
-- produce a recommended reading order
-- enforce safe indexing / summarization limits
-- clearly report skipped files and truncation
-- expose generated artifact file links in the UI
-- include tests for the new logic
-
----
-
-## Implementation plan
-
-### Step 1 — Improve DeveloperAgent intelligence
-**File:** `backend/agents/developer_agent.py`
-
-Add / keep:
-- ignored directories
-- blocked extensions
-- allowed text/source extensions
-- max indexed files
-- max selected files
-- max file size for summarization
-
-Add repo intelligence sections to `report.md`:
-- Project overview
-- How it likely runs
-- Where to start reading
-- Important files
-- Entrypoint candidates
-- Repository limits and indexing
-
-Expected output examples:
-- Project type: Python application
-- Languages: Python, Markdown
-- Frameworks / tools: Python project, Docker
-- Likely run: `python main.py`
-- Reading order:
-  1. README.md
-  2. requirements.txt
-  3. main.py
-
----
-
-### Step 2 — Keep tool layer safe
-**File:** `backend/tools/tool_registry.py`
-
-Ensure tools:
-- ignore junk directories like:
-  - `.git`
-  - `node_modules`
-  - `dist`
-  - `build`
-  - `.venv`
-  - `venv`
-  - `.idea`
-  - `.vscode`
-- raise `ToolError` for unreadable/non-UTF8 text files
-- never escape `workspace/`
-
-This is mostly done, but verify it is the final stable version.
-
----
-
-### Step 3 — Upgrade QA findings
-**File:** `backend/agents/qa_agent.py`
-
-Add rule-based QA checks for:
-- missing README
-- missing test directory
-- missing dependency manifest
-- missing entrypoint
-- missing Docker support
-- TODO / FIXME / HACK counts
-- suspiciously large files
-- repo size risks
-
-Expected `qa_findings.md` sections:
-- Inventory summary
-- Structure checks
-- Deferred work markers
-- Large files
-- Risks
-- Strengths
-
----
-
-### Step 4 — Upgrade ReviewerAgent
-**File:** `backend/agents/reviewer_agent.py`
-
-Make reviewer validate:
-- artifact presence
-- artifact length
-- target subdir consistency
-- report coverage
-- QA coverage
-- code summary coverage
-
-Expected `review.md` sections:
-- Overall status
-- Artifact presence
-- Consistency checks
-- Coverage checks
-- Strengths
-- Concerns
-- Recommended next actions
-
----
-
-### Step 5 — Improve DevOps artifact writing
-**File:** `backend/agents/devops_agent.py`
-
-Keep:
-- `clone_repository`
-- `write_artifacts`
-
-Improve `write_artifacts` to also generate a better `final_summary.md` with:
-- review status
-- indexed file count
-- selected file count
-- project type
-- languages
-- frameworks/tools
-- reading order
-- entrypoints
-- run hints
-- QA highlights
-- review highlights
-- next actions
-
----
-
-### Step 6 — Keep orchestrator aligned
-**File:** `backend/core/orchestrator.py`
-
-Make sure `_build_payload()` passes the correct artifacts:
-
-For `build_qa_findings`:
-- `workspace_files`
-- `workspace_metadata`
-- `selected_files`
-- `report_md`
-
-For `review_outputs`:
-- `report_md`
-- `code_summary_md`
-- `qa_findings_md`
-- `target_subdir`
-
-For `write_artifacts`:
-- `workspace_files`
-- `selected_files`
-- `report_md`
-- `code_summary_md`
-- `qa_findings_md`
-- `review_md`
-- `target_subdir`
-
-No manager change needed right now.
-
----
-
-### Step 7 — Add artifact links to UI
-**Files:**
-- `backend/api/routes.py`
-- `frontend/templates/index.html`
-- `frontend/static/app.js`
-- optionally `frontend/static/styles.css`
-
-Add a lightweight endpoint such as:
-- `GET /api/artifacts`
-
-Return available generated files from `workspace/`, for example:
-- `report.md`
-- `code_summary.md`
-- `qa_findings.md`
-- `review.md`
-- `final_summary.md`
-- `repo_inventory.json`
-- `selected_files.json`
-
-UI should show:
-- clickable artifact list
-- artifact section visible after run
-- no redesign needed
-
-Example display:
-- report.md
-- code_summary.md
-- qa_findings.md
-- review.md
-- final_summary.md
-
-Optional next step later:
-- preview artifact content in a panel
-
----
-
-### Step 8 — Add tests
-**Files:**
-- `tests/test_agents.py`
-- `tests/test_orchestrator.py`
-- maybe new:
-  - `tests/test_repo_intelligence.py`
-  - `tests/test_tool_registry.py`
-
-Add tests for:
-- ignored directories are skipped
-- `.git` files never enter analysis
-- binary/unreadable files are skipped safely
-- repo intelligence detects common files
-- reading order is generated
-- run hints are generated
-- large repo truncation is reported
-- all artifacts use same target subdir
-- final summary is created
-
----
-
-## Suggested order of implementation
-
-1. Finalize `developer_agent.py`
-2. Finalize `qa_agent.py`
-3. Finalize `reviewer_agent.py`
-4. Finalize `devops_agent.py`
-5. Finalize `orchestrator.py`
-6. Add `/api/artifacts`
-7. Update UI to show artifact links
-8. Add tests
-
-This order keeps the backend artifact pipeline stable before touching the frontend.
-
----
-
-## Success checklist
-
-A successful run should now produce:
-
-- `workspace/report.md`
-- `workspace/code_summary.md`
-- `workspace/qa_findings.md`
-- `workspace/review.md`
-- `workspace/final_summary.md`
-- `workspace/repo_inventory.json`
-- `workspace/selected_files.json`
-
-And these should all:
-- reference the same `Target subdir`
-- contain useful project identity info
-- contain run/read guidance
-- survive mixed repos without crashing
-
-UI should:
-- still support Run / Reset
-- still use `/api/state` polling
-- show artifact links after run
-
----
-
-## What comes after this milestone
-
-After Repository Intelligence + Analysis Limits + Artifact UX is stable, then the next milestone should be:
-
-### Real autonomous code agents
-Examples:
-- propose changes
-- edit files inside `workspace/`
-- create patch suggestions
-- write implementation plans
-- later integrate an LLM
-
-But do **not** do that before this repo-intelligence layer is stable.
-
----
-
-## Important note for next chat
-
-When opening the next chat, say:
-
-> Read docs/PROJECT_CONTEXT.md and docs/AGENTS.md.  
-> The current system already supports repo cloning and multi-agent analysis.  
-> We are now implementing the “Repository Intelligence + Analysis Limits + Artifact UX” milestone from next_step.md.  
-> Start with artifact links in the UI and backend `/api/artifacts` endpoint, then add tests.
+## Step 1 — Live Polling During Runs (Frontend)
+
+**Problem:** TaskTable and LogViewer fetch once on mount. During an active run
+you see nothing until you manually refresh.
+
+**Fix:** When `run_in_progress=true`, poll TaskTable and LogViewer every 2-3s.
+Stop polling when run completes.
+
+### Files to change
+- `frontend/src/components/TaskTable.tsx`
+  - Add `useEffect` interval that polls `fetchTasks(runId)` every 2500ms
+  - Only activate interval when `running=true` prop
+  - Clear interval on unmount or when running stops
+- `frontend/src/components/LogViewer.tsx`
+  - Same pattern — poll `fetchLogs(runId)` every 2500ms during active run
+  - Append new logs, don't replace (avoid flicker)
+- `frontend/src/App.tsx`
+  - Pass `running={state.run_in_progress}` to TaskTable and LogViewer
+
+### Props to add
+```tsx
+// TaskTable
+interface Props {
+  runId: string | null;
+  refreshTick: number;
+  running: boolean;   // ← new
+}
+
+// LogViewer
+interface Props {
+  runId: string | null;
+  refreshTick: number;
+  running: boolean;   // ← new
+}
+Step 2 — Run Cancellation (Stop Button)
+Problem: No way to stop a running pipeline mid-execution.
+Critical before adding real LLM agents that cost money.
+
+Fix: Show a Stop button in RepoSelector (next to Run) only when
+running=true. Calls /api/reset which revokes the Celery task.
+
+Files to change
+frontend/src/components/RepoSelector.tsx
+
+Add Stop button next to Run button, visible only when running=true
+
+frontend/src/App.tsx
+
+Wire onStop handler that calls postReset() then poll()
+
+backend/api/routes.py
+
+/api/reset already exists and revokes Celery task — no changes needed
+
+UI pattern
+tsx
+{running ? (
+  <button className="btn btn-danger" onClick={onStop}>
+    <Square size={13} /> Stop
+  </button>
+) : (
+  <button className="btn btn-primary" onClick={onRun}
+    disabled={!repoUrl.trim()}>
+    <Play size={13} /> Run
+  </button>
+)}
+Step 3 — Prompt Versioning
+Problem: All agent prompts are hardcoded strings inside agent Python files.
+Changing a prompt = code change + redeploy.
+
+Fix: Move prompts to backend/prompts/ as YAML files.
+Load at runtime. Each prompt has name + version + template.
+
+Structure
+text
+backend/
+  prompts/
+    scan_and_report_v1.yaml
+    summarize_key_files_v1.yaml
+    build_qa_findings_v1.yaml
+    review_outputs_v1.yaml
+YAML format
+text
+name: scan_and_report
+version: 1
+model: gpt-4o
+max_tokens: 2000
+temperature: 0.2
+system: |
+  You are a senior software engineer analyzing a codebase...
+user_template: |
+  Analyze the following files from {repo_name}:
+  {file_contents}
+  Generate a structured report covering...
+Files to create/change
+backend/prompts/ — create folder + YAML files per task
+
+backend/core/prompt_loader.py — loads YAML, renders template with vars
+
+Each agent — replace hardcoded strings with prompt_loader.get("scan_and_report")
+
+Step 4 — Cost / Token Tracking
+Problem: No visibility into LLM spend per run or per task.
+
+Fix: Add LLMCall table. Every LLM call logs tokens + cost.
+Show per-run total cost in Run History.
+
+New DB table
+python
+class LLMCall(Base):
+    __tablename__ = "llm_calls"
+    id            = Column(UUID, primary_key=True, default=uuid4)
+    run_id        = Column(String, ForeignKey("runs.id"))
+    task_id       = Column(String, ForeignKey("tasks.id"))
+    agent_key     = Column(String)
+    model         = Column(String)
+    prompt_tokens = Column(Integer)
+    completion_tokens = Column(Integer)
+    cost_usd      = Column(Numeric(10, 6))
+    ts            = Column(DateTime)
+Files to create/change
+backend/db/models.py — add LLMCall model
+
+backend/core/llm_client.py — wrapper around OpenAI/Anthropic that logs
+every call to LLMCall table automatically
+
+backend/api/routes.py — add /api/runs/{run_id}/cost endpoint
+
+frontend/src/components/RunHistory.tsx — show cost column
+
+New Alembic migration
+
+Step 5 — First Real Agent
+Start with: DeveloperAgent → scan_and_report task only.
+
+Replace the rule-based report builder with a single GPT-4o call.
+Use prompt from prompts/scan_and_report_v1.yaml.
+Log tokens to LLMCall table.
+Validate output quality before converting other agents.
+
+Files to change
+backend/agents/developer_agent.py
+
+scan_and_report task: read selected files → call llm_client.complete()
+→ return structured markdown report
+
+backend/core/llm_client.py — must exist from Step 4
+
+Current Service Names (docker compose)
+backend — FastAPI + Alembic
+
+frontend — React + Nginx
+
+worker — Celery
+
+postgres — DB
+
+redis — Broker
+
+Rebuild Commands
+powershell
+docker compose up --build -d backend worker   # Python changes
+docker compose up --build -d frontend         # React changes
+docker compose up --build -d                  # Everything
+Key File Locations
+text
+backend/
+  agents/
+    developer_agent.py
+    devops_agent.py
+    qa_agent.py
+    reviewer_agent.py
+    manager.py
+  api/
+    routes.py
+  core/
+    orchestrator.py
+    tasks.py
+  db/
+    models.py
+    session.py
+  prompts/          ← create in Step 3
+
+frontend/src/
+  components/
+    TaskTable.tsx
+    LogViewer.tsx
+    ArtifactViewer.tsx
+    RepoSelector.tsx
+    RunHistory.tsx
+    Header.tsx
+  App.tsx
+  api.ts
+  types.ts
+  index.css

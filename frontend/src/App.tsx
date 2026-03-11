@@ -8,6 +8,7 @@ import ArtifactViewer from "./components/ArtifactViewer";
 import RunHistory from "./components/RunHistory";
 import { fetchState, postRun, postReset } from "./api";
 import type { AppState, Repo } from "./types";
+import CostDashboard from "./components/CostDashboard";
 
 const EMPTY_STATE: AppState = {
   run_in_progress: false,
@@ -58,6 +59,12 @@ export default function App() {
     else await poll();
   };
 
+  const handleStop = async () => {
+    await postReset();
+    await poll();
+    setRefreshTick((t) => t + 1);
+  };
+
   const handleSelectRepo = (repo: Repo | null) => {
     setSelectedRepo(repo);
     if (repo?.url) {
@@ -82,20 +89,16 @@ export default function App() {
           refreshTick={refreshTick}
           running={state.run_in_progress}
           onRun={handleRun}
+          onStop={handleStop}
         />
 
         {error && (
           <div style={{
             gridColumn: "1 / -1",
-            background: "#fef2f2",
-            border: "1px solid #fecaca",
-            borderRadius: 8,
-            padding: "10px 16px",
-            color: "var(--danger)",
-            fontSize: 13,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
+            background: "#fef2f2", border: "1px solid #fecaca",
+            borderRadius: 8, padding: "10px 16px",
+            color: "var(--danger)", fontSize: 13,
+            display: "flex", alignItems: "center", justifyContent: "space-between",
           }}>
             <span>{error}</span>
             <button onClick={() => setError(null)}
@@ -106,12 +109,21 @@ export default function App() {
 
         <div className="grid-left">
           <AgentsPanel agents={state.agents} />
+          <CostDashboard refreshTick={refreshTick} />
           <RunHistory currentRunId={activeRunId} refreshTick={refreshTick} />
         </div>
 
         <div className="grid-right">
-          <TaskTable      runId={activeRunId} refreshTick={refreshTick} />
-          <LogViewer      runId={activeRunId} refreshTick={refreshTick} />
+          <TaskTable
+            runId={activeRunId}
+            refreshTick={refreshTick}
+            running={state.run_in_progress}
+          />
+          <LogViewer
+            runId={activeRunId}
+            refreshTick={refreshTick}
+            running={state.run_in_progress}
+          />
           <ArtifactViewer runId={activeRunId} refreshTick={refreshTick} />
         </div>
       </main>

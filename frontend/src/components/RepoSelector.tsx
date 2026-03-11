@@ -1,19 +1,20 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   FolderGit2, Trash2, Download,
-  ExternalLink, HardDrive, Calendar, Play, Loader,
+  ExternalLink, HardDrive, Calendar, Play, Loader, Square,
 } from "lucide-react";
 import type { Repo } from "../types";
 import { fetchRepos, deleteRepo, repoDownloadUrl } from "../api";
 
 interface Props {
-  selected: Repo | null;
-  onSelect: (repo: Repo | null) => void;
-  repoUrl: string;
+  selected:        Repo | null;
+  onSelect:        (repo: Repo | null) => void;
+  repoUrl:         string;
   onRepoUrlChange: (v: string) => void;
-  refreshTick: number;
-  running: boolean;
-  onRun: () => void;
+  refreshTick:     number;
+  running:         boolean;
+  onRun:           () => void;
+  onStop:          () => void;  // ← new
 }
 
 function fmt(bytes: number): string {
@@ -23,7 +24,8 @@ function fmt(bytes: number): string {
 }
 
 export default function RepoSelector({
-  selected, onSelect, repoUrl, onRepoUrlChange, refreshTick, running, onRun,
+  selected, onSelect, repoUrl, onRepoUrlChange,
+  refreshTick, running, onRun, onStop,
 }: Props) {
   const [repos, setRepos]       = useState<Repo[]>([]);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -46,10 +48,7 @@ export default function RepoSelector({
     if (!confirm(`Delete "${repo.name}" from workspace?\n\nThis removes all cloned files from disk.`)) return;
     setDeleting(repo.id);
     await deleteRepo(repo.id);
-    if (selected?.id === repo.id) {
-      onSelect(null);
-      onRepoUrlChange("");
-    }
+    if (selected?.id === repo.id) { onSelect(null); onRepoUrlChange(""); }
     await load();
     setDeleting(null);
   };
@@ -72,7 +71,7 @@ export default function RepoSelector({
 
       <div className="card-body" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
 
-        {/* URL input + Run button */}
+        {/* URL input + Run/Stop button */}
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <input
             className="repo-input"
@@ -80,20 +79,33 @@ export default function RepoSelector({
             value={repoUrl}
             onChange={(e) => onRepoUrlChange(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && !running && onRun()}
+            disabled={running}
             style={{ flex: 1 }}
           />
-          <button
-            className="btn btn-primary"
-            onClick={onRun}
-            disabled={running || !repoUrl.trim()}
-            style={{ whiteSpace: "nowrap" }}
-          >
-            {running
-              ? <><Loader size={13} className="spinning" /> Running…</>
-              : <><Play size={13} /> Run</>
-            }
-          </button>
+          {running ? (
+            <button className="btn btn-danger" onClick={onStop} style={{ whiteSpace: "nowrap" }}>
+              <Square size={13} /> Stop
+            </button>
+          ) : (
+            <button
+              className="btn btn-primary"
+              onClick={onRun}
+              disabled={!repoUrl.trim()}
+              style={{ whiteSpace: "nowrap" }}
+            >
+              <Play size={13} /> Run
+            </button>
+          )}
         </div>
+
+        {/* Running indicator */}
+        {running && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8,
+                        fontSize: 12, color: "#3b82f6" }}>
+            <Loader size={12} className="spinning" />
+            Pipeline running — tasks and logs updating live…
+          </div>
+        )}
 
         {/* Repo chips */}
         {repos.length > 0 ? (
@@ -116,33 +128,23 @@ export default function RepoSelector({
                       {r.cloned_at ? new Date(r.cloned_at).toLocaleDateString() : "—"}
                     </span>
                     {r.url && (
-                      <a
-                        href={r.url}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(e) => e.stopPropagation()}
-                        style={{ display: "flex", alignItems: "center", gap: 3,
-                                 color: "var(--primary)", textDecoration: "none", fontSize: 11 }}
-                      >
+                      <a href={r.url} target="_blank" rel="noreferrer"
+                         onClick={(e) => e.stopPropagation()}
+                         style={{ display: "flex", alignItems: "center", gap: 3,
+                                  color: "var(--primary)", textDecoration: "none", fontSize: 11 }}>
                         <ExternalLink size={10} /> GitHub
                       </a>
                     )}
                   </div>
                 </div>
                 <div className="repo-chip-actions">
-                  <button
-                    className="icon-btn"
-                    title="Download ZIP"
-                    onClick={(e) => handleDownload(e, r.id)}
-                  >
+                  <button className="icon-btn" title="Download ZIP"
+                          onClick={(e) => handleDownload(e, r.id)}>
                     <Download size={13} />
                   </button>
-                  <button
-                    className="icon-btn icon-btn-danger"
-                    title="Delete repo"
-                    onClick={(e) => handleDelete(e, r)}
-                    disabled={deleting === r.id}
-                  >
+                  <button className="icon-btn icon-btn-danger" title="Delete repo"
+                          onClick={(e) => handleDelete(e, r)}
+                          disabled={deleting === r.id || running}>
                     <Trash2 size={13} />
                   </button>
                 </div>

@@ -1,4 +1,4 @@
-import type { AppState, Repo, Run, Artifact, Task, LogEntry } from "./types";
+import type { AppState, Repo, Run, Artifact, Task, LogEntry, CostData } from "./types";
 
 const BASE = "";
 
@@ -51,10 +51,7 @@ export async function fetchArtifacts(runId: string): Promise<Artifact[]> {
   return r.json();
 }
 
-export async function fetchArtifactContent(
-  runId: string,
-  name: string
-): Promise<string> {
+export async function fetchArtifactContent(runId: string, name: string): Promise<string> {
   const r = await fetch(`${BASE}/api/artifacts/${runId}/${name}`);
   const j = await r.json();
   return j.content ?? "";
@@ -62,4 +59,9 @@ export async function fetchArtifactContent(
 
 export function repoDownloadUrl(id: string): string {
   return `${BASE}/api/repos/${id}/download`;
+}
+
+export async function fetchCosts(): Promise<CostData> {
+  const r = await fetch(`${BASE}/api/costs`);
+  return r.json();
 }

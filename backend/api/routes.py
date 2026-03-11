@@ -1,17 +1,15 @@
 from __future__ import annotations
-
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-
 from fastapi import APIRouter, Depends
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
-from sqlalchemy import func
 from sqlalchemy.orm import Session
-from starlette.requests import Request
-
+import os
+from backend.db.models import LLMCall
+from sqlalchemy import func, extract
 from backend.db.models import AgentEvent, Log, Run, Task, Artifact, utcnow
 from backend.db.session import get_db
 from backend.tasks.pipeline_task import run_pipeline
@@ -240,6 +238,80 @@ def api_repos(db: Session = Depends(get_db)):
         }
         for r in repos
     ])
+
+
+@router.get("/api/costs")
+def api_costs(db: Session = Depends(get_db)):
+    from datetime import datetime, timezone
+    now    = datetime.now(timezone.utc)
+    budget = float(os.environ.get("LLM_BUDGET_USD", "15.00"))
+
+    monthly = db.query(
+        func.sum(LLMCall.cost_usd).label("cost"),
+        func.sum(LLMCall.total_tokens).label("tokens"),
+        func.count(LLMCall.id).label("calls"),
+    ).filter(
+        extract("year",  LLMCall.ts) == now.year,
+        extract("month", LLMCall.ts) == now.month,
+    ).first()
+
+    per_run = db.query(
+        LLMCall.run_id,
+        func.sum(LLMCall.cost_usd).label("cost"),
+        func.sum(LLMCall.total_tokens).label("tokens"),
+        func.count(LLMCall.id).label("calls"),
+    ).filter(
+        extract("year",  LLMCall.ts) == now.year,
+        extract("month", LLMCall.ts) == now.month,
+        LLMCall.run_id.isnot(None),
+    ).group_by(LLMCall.run_id).order_by(func.sum(LLMCall.cost_usd).desc()).limit(20).all()
+
+    per_model = db.query(
+        LLMCall.model,
+        func.sum(LLMCall.cost_usd).label("cost"),
+        func.sum(LLMCall.total_tokens).label("tokens"),
+    ).filter(
+        extract("year",  LLMCall.ts) == now.year,
+        extract("month", LLMCall.ts) == now.month,
+    ).group_by(LLMCall.model).all()
+
+    spent = float(monthly.cost or 0)
+
+    return JSONResponse({
+        "budget_usd":    budget,
+        "spent_usd":     round(spent, 4),
+        "remaining_usd": round(max(budget - spent, 0), 4),
+        "percent_used":  round((spent / budget * 100) if budget > 0 else 0, 1),
+        "total_tokens":  int(monthly.tokens or 0),
+        "total_calls":   int(monthly.calls  or 0),
+        "within_budget": spent < budget,
+        "period":        now.strftime("%B %Y"),
+        "per_run": [
+            {
+                "run_id":   str(r.run_id),
+                "cost_usd": round(float(r.cost), 4),
+                "tokens":   int(r.tokens),
+                "calls":    int(r.calls),
+            }
+            for r in per_run
+        ],
+        "per_model": [
+            {
+                "model":    r.model,
+                "cost_usd": round(float(r.cost), 4),
+                "tokens":   int(r.tokens),
+            }
+            for r in per_model
+        ],
+    })
+
+
+@router.post("/api/costs/refresh-pricing")
+def api_refresh_pricing():
+    """Force refresh of LLM pricing cache from litellm."""
+    from backend.core.pricing import refresh_now
+    count = refresh_now()
+    return JSONResponse({"ok": True, "models_loaded": count})
 
 
 @router.delete("/api/repos/{repo_id}")

@@ -1,20 +1,34 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { ListChecks } from "lucide-react";
 import { fetchTasks } from "../api";
 import type { Task } from "../types";
 
 interface Props {
-  runId: string | null;
-  refreshTick: number;        // ← add
+  runId:       string | null;
+  refreshTick: number;
+  running:     boolean;
 }
 
-export default function TaskTable({ runId, refreshTick }: Props) {
+export default function TaskTable({ runId, refreshTick, running }: Props) {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const intervalRef        = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  useEffect(() => {
+  const load = () => {
     if (!runId) { setTasks([]); return; }
     fetchTasks(runId).then(setTasks);
-  }, [runId, refreshTick]);
+  };
+
+  // Fetch on runId / refreshTick change
+  useEffect(() => { load(); }, [runId, refreshTick]);
+
+  // Poll every 2.5s while a run is active
+  useEffect(() => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    if (running && runId) {
+      intervalRef.current = setInterval(load, 2500);
+    }
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+  }, [running, runId]);
 
   return (
     <div className="card">
@@ -26,6 +40,7 @@ export default function TaskTable({ runId, refreshTick }: Props) {
           </span>
         </span>
       </div>
+
       <div className="card-body" style={{ padding: 0 }}>
         {tasks.length === 0 ? (
           <p className="empty">No tasks yet</p>
@@ -45,8 +60,10 @@ export default function TaskTable({ runId, refreshTick }: Props) {
                 <tr key={t.id}>
                   <td className="task-id">{t.id.slice(0, 8)}</td>
                   <td>{t.title}</td>
-                  <td style={{ fontFamily: "var(--mono)", fontSize: 11 }}>
-                    {t.assigned_agent}
+                  <td>
+                    <span style={{ fontSize: 12, color: "var(--text-soft)" }}>
+                      {t.assigned_agent}
+                    </span>
                   </td>
                   <td>
                     <span className={`badge badge-${t.status}`}>
@@ -54,19 +71,7 @@ export default function TaskTable({ runId, refreshTick }: Props) {
                       {t.status}
                     </span>
                   </td>
-                  <td
-                    style={{
-                      fontSize: 12,
-                      color: "var(--text-soft)",
-                      maxWidth: 220,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                    }}
-                    title={t.result ?? ""}
-                  >
-                    {t.result ?? "—"}
-                  </td>
+                  <td className="task-result">{t.result ?? "—"}</td>
                 </tr>
               ))}
             </tbody>
