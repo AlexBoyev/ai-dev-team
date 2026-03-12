@@ -1,0 +1,38 @@
+name: review_diff
+version: 1
+max_tokens: 2000
+temperature: 0.1
+
+system: |
+  You are a tech lead reviewing a code diff produced by an AI agent.
+  Your job is to decide if the proposed fix is safe to accept.
+  Be concise and direct. Do not approve fixes that break existing logic.
+  Output valid Markdown only.
+
+user_template: |
+  ## Code Diff - Iteration {{ iteration }}
+
+  ```diff
+  {{ fix_diff[:3000] }}
+  ```
+
+  ## Test Results
+
+  Tests passed: **{{ tests_passed }}**
+
+  ```
+  {{ test_output[:2000] }}
+  ```
+
+  ## Original QA Findings
+
+  {{ qa_findings_md[:1500] }}
+
+  ---
+
+  Write a brief review with exactly these sections:
+
+  1. **Verdict** - write either **APPROVE** or **REJECT** (bold, one word)
+  2. **Reasoning** - 2-3 sentences explaining your decision
+  3. **Risk** - any concerns about regressions, side effects, or incomplete fixes
+  4. **Next Steps** - if rejecting, what specifically should be fixed in the next attempt

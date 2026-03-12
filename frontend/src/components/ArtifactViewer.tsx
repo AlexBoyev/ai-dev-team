@@ -4,23 +4,23 @@ import { fetchArtifacts, fetchArtifactContent } from "../api";
 import type { Artifact } from "../types";
 
 interface Props {
-  runId: string | null;
-  refreshTick: number;
+  runId:        string | null;
+  refreshTick:  number;
 }
 
 export default function ArtifactViewer({ runId, refreshTick }: Props) {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [active, setActive]       = useState<string | null>(null);
-  const [content, setContent]     = useState("");
-  const [loading, setLoading]     = useState(false);
-  const [expanded, setExpanded]   = useState(true);
+  const [active,    setActive]    = useState<string | null>(null);
+  const [content,   setContent]   = useState("");
+  const [loading,   setLoading]   = useState(false);
+  const [expanded,  setExpanded]  = useState(true);
   const prevRunId                 = useRef<string | null>(null);
 
+  // ── Load artifact list ──────────────────────────────────────────────────
   useEffect(() => {
     const runChanged = runId !== prevRunId.current;
     prevRunId.current = runId;
 
-    // Only wipe state when switching repos, not on tick refresh
     if (runChanged) {
       setArtifacts([]);
       setActive(null);
@@ -31,21 +31,26 @@ export default function ArtifactViewer({ runId, refreshTick }: Props) {
 
     fetchArtifacts(runId).then((data) => {
       setArtifacts(data);
-      // Set first tab only if nothing is active yet
       setActive((prev) => prev ?? (data.length > 0 ? data[0].name : null));
     });
   }, [runId, refreshTick]);
 
+  // ── Load selected file content ──────────────────────────────────────────
   useEffect(() => {
-    if (!runId || !active) { setContent(""); return; }
+    if (!runId || !active) {
+      setContent("");
+      return;
+    }
     setLoading(true);
     fetchArtifactContent(runId, active)
-      .then(setContent)
+      .then((res) => setContent(res.content))
       .catch(() => setContent("Failed to load file content."))
       .finally(() => setLoading(false));
   }, [active, runId]);
 
   if (!runId || artifacts.length === 0) return null;
+
+  const activeArtifact = artifacts.find((a) => a.name === active);
 
   return (
     <div className="card">
@@ -76,15 +81,17 @@ export default function ArtifactViewer({ runId, refreshTick }: Props) {
                 onClick={() => setActive(a.name)}
                 title={`${a.name} — ${(a.size_bytes / 1024).toFixed(1)} KB`}
                 style={{
-                  padding: "4px 10px",
-                  fontSize: 12,
+                  padding:     "4px 10px",
+                  fontSize:    12,
                   borderRadius: 20,
-                  border: active === a.name ? "1.5px solid var(--primary)" : "1.5px solid var(--border)",
-                  background: active === a.name ? "var(--primary)" : "transparent",
-                  color: active === a.name ? "#fff" : "var(--text)",
-                  cursor: "pointer",
-                  fontFamily: "var(--mono)",
-                  transition: "all 0.15s ease",
+                  border:      active === a.name
+                    ? "1.5px solid var(--primary)"
+                    : "1.5px solid var(--border)",
+                  background:  active === a.name ? "var(--primary)" : "transparent",
+                  color:       active === a.name ? "#fff" : "var(--text)",
+                  cursor:      "pointer",
+                  fontFamily:  "var(--mono)",
+                  transition:  "all 0.15s ease",
                 }}
               >
                 {a.name}
@@ -93,28 +100,40 @@ export default function ArtifactViewer({ runId, refreshTick }: Props) {
           </div>
 
           {/* File size hint */}
-          {active && (
+          {active && activeArtifact && (
             <div style={{ fontSize: 11, color: "var(--text-soft)" }}>
-              {active} &middot;&nbsp;
-              {((artifacts.find((a) => a.name === active)?.size_bytes ?? 0) / 1024).toFixed(1)} KB
+              {active}&nbsp;&middot;&nbsp;
+              {(activeArtifact.size_bytes / 1024).toFixed(1)} KB
             </div>
           )}
 
           {/* Content */}
           {loading ? (
-            <p style={{ fontSize: 12, color: "var(--text-soft)" }}>Loading...</p>
+            <p style={{ fontSize: 12, color: "var(--text-soft)" }}>
+              Loading...
+            </p>
           ) : content ? (
-            <pre style={{
-              margin: 0, padding: "10px 12px", fontSize: 12, lineHeight: 1.6,
-              overflowX: "auto", background: "var(--bg)", borderRadius: 6,
-              border: "1px solid var(--border)", maxHeight: 400, overflowY: "auto",
-              whiteSpace: "pre-wrap", wordBreak: "break-word",
-            }}>
+            <pre
+              style={{
+                margin:      0,
+                padding:     "10px 12px",
+                fontSize:    12,
+                lineHeight:  1.6,
+                overflowX:   "auto",
+                background:  "var(--bg)",
+                borderRadius: 6,
+                border:      "1px solid var(--border)",
+                maxHeight:   400,
+                overflowY:   "auto",
+                whiteSpace:  "pre-wrap",
+                wordBreak:   "break-word",
+              }}
+            >
               {content}
             </pre>
           ) : (
             <p style={{ fontSize: 12, color: "var(--text-soft)" }}>
-              Select a file above to view its contents
+              Select a file above to view its contents.
             </p>
           )}
 

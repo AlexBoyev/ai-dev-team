@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -20,19 +20,21 @@ class Base(DeclarativeBase):
 class Run(Base):
     __tablename__ = "runs"
 
-    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    started_at  = Column(DateTime(timezone=True), default=utcnow)
-    finished_at = Column(DateTime(timezone=True), nullable=True)
-    status      = Column(String(32), default="running")
-    repo_url    = Column(Text, nullable=True)
-    note        = Column(Text, nullable=True)
+    id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    started_at        = Column(DateTime(timezone=True), default=utcnow)
+    finished_at       = Column(DateTime(timezone=True), nullable=True)
+    status            = Column(String(32), default="running")
+    repo_url          = Column(Text, nullable=True)
+    note              = Column(Text, nullable=True)
+    current_iteration = Column(Integer, default=0)
+    awaiting_approval = Column(Boolean, default=False)
 
-    tasks      = relationship("Task", back_populates="run", cascade="all, delete-orphan")
-    logs       = relationship("Log", back_populates="run", cascade="all, delete-orphan")
-    agents     = relationship("AgentEvent", back_populates="run", cascade="all, delete-orphan")
-    artifacts  = relationship("Artifact", back_populates="run", cascade="all, delete-orphan")
-    llm_calls  = relationship("LLMCall", foreign_keys="LLMCall.run_id", cascade="all, delete-orphan")
-    agent_logs = relationship("AgentLog", foreign_keys="AgentLog.run_id", cascade="all, delete-orphan")
+    tasks       = relationship("Task", back_populates="run", cascade="all, delete-orphan")
+    logs        = relationship("Log", back_populates="run", cascade="all, delete-orphan")
+    agents      = relationship("AgentEvent", back_populates="run", cascade="all, delete-orphan")
+    artifacts   = relationship("Artifact", back_populates="run", cascade="all, delete-orphan")
+    llm_calls   = relationship("LLMCall", foreign_keys="LLMCall.run_id", cascade="all, delete-orphan")
+    agent_logs  = relationship("AgentLog", foreign_keys="AgentLog.run_id", cascade="all, delete-orphan")
     memory_rows = relationship("RunMemory", foreign_keys="RunMemory.run_id", cascade="all, delete-orphan")
 
 
@@ -46,6 +48,8 @@ class Task(Base):
     assigned_agent = Column(String(64))
     status         = Column(String(32), default="pending")
     result         = Column(Text, nullable=True)
+    iteration      = Column(Integer, default=0)
+    approved       = Column(Boolean, nullable=True)
     created_at     = Column(DateTime(timezone=True), default=utcnow)
     updated_at     = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

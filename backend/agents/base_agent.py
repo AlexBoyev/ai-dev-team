@@ -15,7 +15,7 @@ from backend.db.models import AgentLog, LLMCall
 from backend.tools.tool_registry import ToolContext, run_tool
 
 logger = logging.getLogger(__name__)
-
+from backend.core.config import LLMConfig
 
 @dataclass(frozen=True)
 class AgentProfile:
@@ -224,13 +224,11 @@ class BaseAgent:
 
     @staticmethod
     def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-        pricing = {
-            "claude-3-5-sonnet-20241022": (3.00, 15.00),
-            "claude-3-5-haiku-20241022": (0.80, 4.00),
-            "claude-3-opus-20240229": (15.00, 75.00),
+        PRICING = {
+            LLMConfig.MODEL_CHEAP: (0.80, 4.00),
             "claude-3-haiku-20240307": (0.25, 1.25),
         }
-        in_price, out_price = pricing.get(model, (0.0, 0.0))
+        in_price, out_price = PRICING.get(model, (0.0, 0.0))
         return (prompt_tokens * in_price + completion_tokens * out_price) / 1_000_000
 
     @staticmethod

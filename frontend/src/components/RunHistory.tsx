@@ -5,14 +5,14 @@ import type { Run } from "../types";
 
 interface Props {
   currentRunId: string | null;
-  refreshTick: number;
+  refreshTick:  number;
 }
 
 function timeAgo(iso: string | null): string {
   if (!iso) return "—";
   const diff = Date.now() - new Date(iso).getTime();
   const m = Math.floor(diff / 60000);
-  if (m < 1) return "just now";
+  if (m < 1)  return "just now";
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h ago`;
@@ -20,23 +20,25 @@ function timeAgo(iso: string | null): string {
 }
 
 function duration(started: string | null, finished: string | null): string {
-  if (!started) return "—";
+  if (!started)  return "—";
   if (!finished) return "running...";
   const s = Math.round(
-    (new Date(finished).getTime() - new Date(started).getTime()) / 1000
+    (new Date(finished).getTime() - new Date(started).getTime()) / 1000,
   );
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 }
+
+const repoName = (url: string | null): string =>
+  url
+    ? url.replace("https://github.com/", "").replace("http://github.com/", "")
+    : "—";
 
 export default function RunHistory({ currentRunId, refreshTick }: Props) {
   const [runs, setRuns] = useState<Run[]>([]);
 
   useEffect(() => {
-    fetchRuns(50).then(setRuns);
+    fetchRuns(50).then(setRuns).catch(() => {});
   }, [refreshTick]);
-
-  const repoName = (url: string | null) =>
-    url ? url.replace("https://github.com/", "").replace("http://github.com/", "") : "—";
 
   return (
     <div className="card">
@@ -59,18 +61,26 @@ export default function RunHistory({ currentRunId, refreshTick }: Props) {
                 <th>ID</th>
                 <th>Repo</th>
                 <th>Status</th>
+                <th>Iter</th>
                 <th>When</th>
                 <th>Duration</th>
               </tr>
             </thead>
             <tbody>
               {runs.map((r) => (
-                <tr key={r.id}
-                  style={{ background: r.id === currentRunId ? "#f0f7ff" : undefined }}>
+                <tr
+                  key={r.id}
+                  style={{ background: r.id === currentRunId ? "#f0f7ff" : undefined }}
+                >
                   <td className="task-id">{r.id.slice(0, 8)}</td>
-                  <td style={{ fontSize: 12, color: "var(--text-soft)",
-                               maxWidth: 160, overflow: "hidden",
-                               textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  <td style={{
+                    fontSize:     12,
+                    color:        "var(--text-soft)",
+                    maxWidth:     160,
+                    overflow:     "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace:   "nowrap",
+                  }}>
                     {repoName(r.repo_url)}
                   </td>
                   <td>
@@ -78,6 +88,22 @@ export default function RunHistory({ currentRunId, refreshTick }: Props) {
                       <span className={`dot ${r.status === "running" ? "dot-pulse" : ""}`} />
                       {r.status}
                     </span>
+                    {r.awaiting_approval && (
+                      <span style={{
+                        marginLeft:  6,
+                        fontSize:    10,
+                        fontWeight:  600,
+                        color:       "#d97706",
+                        background:  "#fef3c7",
+                        padding:     "2px 6px",
+                        borderRadius: 4,
+                      }}>
+                        awaiting review
+                      </span>
+                    )}
+                  </td>
+                  <td style={{ fontSize: 11, color: "var(--text-soft)", textAlign: "center" }}>
+                    {r.current_iteration > 0 ? `#${r.current_iteration}` : "—"}
                   </td>
                   <td style={{ fontSize: 11, color: "var(--text-soft)" }}>
                     {timeAgo(r.started_at)}

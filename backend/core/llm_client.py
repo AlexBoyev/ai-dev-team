@@ -9,8 +9,8 @@ from sqlalchemy.orm import Session
 
 from backend.db.models import LLMCall
 from backend.core.pricing import get_price
-
-DEFAULT_MODEL = "claude-3-5-haiku-20241022"
+from backend.core.config import LLMConfig
+DEFAULT_MODEL = LLMConfig.MODEL_CHEAP
 
 
 def _calc_cost(model: str, prompt_tokens: int, completion_tokens: int) -> Decimal:

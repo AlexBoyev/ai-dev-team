@@ -12,7 +12,15 @@ class _CleanAccessLog(logging.Filter):
     - The internal 0.0.0.0:8010 startup message
     """
     _SUPPRESS = (
+        # polling endpoints that spam every 2-4s
         "GET /api/state",
+        "GET /api/logs/",
+        "GET /api/tasks/",
+        "GET /api/artifacts/",
+        "GET /api/runs?limit=",
+        "GET /api/repos",
+        "GET /api/costs",
+        # startup noise
         "0.0.0.0:8010",
         "http://0.0.0.0",
     )

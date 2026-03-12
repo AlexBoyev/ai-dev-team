@@ -5,7 +5,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from backend.agents import DeveloperAgent, DevOpsAgent, QaAgent, ReviewerAgent
 from backend.agents.manager import ManagerAgent
@@ -15,6 +15,7 @@ from backend.db.session import get_db_session
 from backend.tools.tool_registry import ToolContext
 
 WORKSPACE_ROOT = Path("workspace")
+MAX_FIX_ITERATIONS = int(os.environ.get("MAX_FIX_ITERATIONS", "3"))
 
 ARTIFACT_FILES = [
     "report.md",
@@ -44,24 +45,12 @@ def _run_artifact_dir(workspace_root: Path, run_id: str) -> Path:
 
 
 def _add_log(db, run_id: str, level: str, source: str, message: str) -> None:
-    db.add(Log(
-        run_id=run_id,
-        ts=utcnow(),
-        level=level,
-        source=source,
-        message=message,
-    ))
+    db.add(Log(run_id=run_id, ts=utcnow(), level=level, source=source, message=message))
     db.commit()
 
 
 def _update_agent(db, run_id: str, agent_key: str, status: str, action: str = "") -> None:
-    db.add(AgentEvent(
-        run_id=run_id,
-        agent_key=agent_key,
-        status=status,
-        action=action,
-        ts=utcnow(),
-    ))
+    db.add(AgentEvent(run_id=run_id, agent_key=agent_key, status=status, action=action, ts=utcnow()))
     db.commit()
 
 
@@ -75,75 +64,149 @@ def _build_agents() -> Dict[str, Any]:
     }
 
 
-def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, Any]:
-    payload = dict(task.payload)
+def _create_task_row(db, run_id: str, planned: PlannedTask, iteration: int = 0) -> str:
+    task_db_id = str(uuid.uuid4())
+    task_row = Task(
+        id=task_db_id,
+        run_id=run_id,
+        title=planned.title,
+        task_type=planned.task_type,
+        assigned_agent=planned.assigned_agent,
+        status="pending",
+        iteration=iteration,
+        created_at=utcnow(),
+        updated_at=utcnow(),
+    )
+    db.add(task_row)
+    db.commit()
+    return task_db_id
+
+
+def _run_single_task(
+    db,
+    run_id: str,
+    planned: PlannedTask,
+    agents: Dict[str, Any],
+    ctx: ToolContext,
+    payload: Dict[str, Any],
+    iteration: int = 0,
+) -> Dict[str, Any]:
+    task_db_id = _create_task_row(db, run_id, planned, iteration)
+    ctx.task_id = task_db_id
+
+    task_row = db.query(Task).filter(Task.id == task_db_id).first()
+    task_row.status = "in_progress"
+    task_row.updated_at = utcnow()
+    db.commit()
+
+    _update_agent(db, run_id, planned.assigned_agent, "working", f"Starting: {planned.title}")
+
+    timeout_seconds = int(os.environ.get("MAX_TASK_TIMEOUT_SECONDS", "300"))
+    agent = agents[planned.assigned_agent]
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(agent.run_task, planned.task_type, ctx, payload)
+        try:
+            result = future.result(timeout=timeout_seconds)
+        except FutureTimeoutError:
+            raise RuntimeError(f"Task timed out after {timeout_seconds}s: {planned.title}")
+
+    result_message = str(result.get("result_message", "Done"))
+    task_row.status = "completed"
+    task_row.result = result_message
+    task_row.updated_at = utcnow()
+    db.commit()
+
+    _update_agent(db, run_id, planned.assigned_agent, "idle", result_message)
+    _add_log(db, run_id, "INFO", "orchestrator",
+             f"Task completed | agent={planned.assigned_agent} | {result_message}")
+
+    return result, task_db_id
+
+
+def _build_payload(task_type: str, artifacts: Dict[str, Any], extra: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    payload = dict(extra or {})
     repo_path = str(artifacts.get("repo_path", "")).strip()
 
-    if task.task_type in {
-        "inventory_workspace",
-        "select_key_files",
-        "summarize_key_files",
-        "scan_and_report",
-        "build_qa_findings",
-        "review_outputs",
-        "write_artifacts",
+    if task_type in {
+        "inventory_workspace", "select_key_files", "summarize_key_files",
+        "scan_and_report", "build_qa_findings", "review_outputs",
+        "write_artifacts", "generate_fix", "run_tests", "review_diff",
     }:
         payload["target_subdir"] = repo_path
 
-    if task.task_type == "select_key_files":
+    payload["artifact_dir"] = str(artifacts.get("artifact_dir", ""))
+
+    if task_type == "select_key_files":
         payload["workspace_metadata"] = artifacts.get("workspace_metadata", [])
-
-    elif task.task_type == "summarize_key_files":
+    elif task_type == "summarize_key_files":
         payload["selected_files"] = artifacts.get("selected_files", [])
-
-    elif task.task_type == "build_qa_findings":
+    elif task_type == "scan_and_report":
         payload["workspace_files"] = artifacts.get("workspace_files", [])
-        payload["workspace_metadata"] = artifacts.get("workspace_metadata", [])
-        payload["selected_files"] = artifacts.get("selected_files", [])
-        payload["report_md"] = artifacts.get("report_md", "")
-
-    elif task.task_type == "review_outputs":
-        payload["report_md"] = artifacts.get("report_md", "")
-        payload["code_summary_md"] = artifacts.get("code_summary_md", "")
-        payload["qa_findings_md"] = artifacts.get("qa_findings_md", "")
-
-    elif task.task_type == "write_artifacts":
-        payload["workspace_files"] = artifacts.get("workspace_files", [])
-        payload["selected_files"] = artifacts.get("selected_files", [])
-        payload["report_md"] = artifacts.get("report_md", "")
-        payload["code_summary_md"] = artifacts.get("code_summary_md", "")
-        payload["qa_findings_md"] = artifacts.get("qa_findings_md", "")
-        payload["review_md"] = artifacts.get("review_md", "")
-        payload["artifact_dir"] = str(artifacts.get("artifact_dir", ""))
+    elif task_type == "build_qa_findings":
+        payload.update({
+            "workspace_files": artifacts.get("workspace_files", []),
+            "workspace_metadata": artifacts.get("workspace_metadata", []),
+            "selected_files": artifacts.get("selected_files", []),
+            "report_md": artifacts.get("report_md", ""),
+        })
+    elif task_type == "review_outputs":
+        payload.update({
+            "report_md": artifacts.get("report_md", ""),
+            "code_summary_md": artifacts.get("code_summary_md", ""),
+            "qa_findings_md": artifacts.get("qa_findings_md", ""),
+        })
+    elif task_type == "write_artifacts":
+        payload.update({
+            "workspace_files": artifacts.get("workspace_files", []),
+            "selected_files": artifacts.get("selected_files", []),
+            "report_md": artifacts.get("report_md", ""),
+            "code_summary_md": artifacts.get("code_summary_md", ""),
+            "qa_findings_md": artifacts.get("qa_findings_md", ""),
+            "review_md": artifacts.get("review_md", ""),
+        })
+    elif task_type == "generate_fix":
+        payload.update({
+            "qa_findings_md": artifacts.get("qa_findings_md", ""),
+            "selected_files": artifacts.get("selected_files", []),
+        })
+    elif task_type == "run_tests":
+        pass
+    elif task_type == "review_diff":
+        payload.update({
+            "fix_diff": artifacts.get("fix_diff", ""),
+            "qa_findings_md": artifacts.get("qa_findings_md", ""),
+            "test_output": artifacts.get("test_output", ""),
+            "tests_passed": artifacts.get("tests_passed", False),
+            "auto_approve": os.environ.get("AUTO_APPROVE_FIXES", "false").lower() == "true",
+        })
 
     return payload
 
 
-def _register_repo(db, run_id: str, repo_url: str, artifacts: Dict[str, Any], workspace_root: Path) -> None:
-    repo_path_rel = (
-        artifacts.get("repo_path")
-        or artifacts.get("cloned_path")
-        or artifacts.get("path")
-        or artifacts.get("result_path")
-        or ""
-    )
-    repo_path_rel = str(repo_path_rel).strip()
+def _check_disk_quota(workspace_root: Path) -> None:
+    limit_mb = int(os.environ.get("MAX_DISK_MB", "500"))
+    used_bytes = sum(f.stat().st_size for f in workspace_root.rglob("*") if f.is_file())
+    if used_bytes > limit_mb * 1024 * 1024:
+        raise RuntimeError(
+            f"Disk quota exceeded: {used_bytes // (1024 * 1024)}MB > {limit_mb}MB"
+        )
 
+
+def _register_repo(db, run_id, repo_url, artifacts, workspace_root) -> None:
+    repo_path_rel = str(artifacts.get("repo_path", "")).strip()
     if not repo_path_rel and repo_url:
         repo_name = repo_url.rstrip("/").split("/")[-1]
         repo_path_rel = f"repos/{repo_name}"
-
     if not repo_path_rel:
         return
 
     full_path = workspace_root / repo_path_rel
     name = full_path.name
-
     disk_bytes = 0
     if full_path.exists():
         disk_bytes = sum(
-            f.stat().st_size
-            for f in full_path.rglob("*")
+            f.stat().st_size for f in full_path.rglob("*")
             if f.is_file() and ".git" not in f.parts
         )
 
@@ -154,50 +217,35 @@ def _register_repo(db, run_id: str, repo_url: str, artifacts: Dict[str, Any], wo
         existing.updated_at = utcnow()
     else:
         db.add(Repository(
-            name=name,
-            url=repo_url,
-            local_path=str(full_path),
-            disk_bytes=disk_bytes,
-            last_run_id=run_id,
-            cloned_at=utcnow(),
-            updated_at=utcnow(),
+            name=name, url=repo_url, local_path=str(full_path),
+            disk_bytes=disk_bytes, last_run_id=run_id,
+            cloned_at=utcnow(), updated_at=utcnow(),
         ))
-
     db.commit()
 
 
 def _register_artifacts(db, run_id: str, artifact_dir: Path) -> None:
-    for name in ARTIFACT_FILES:
+    all_names = ARTIFACT_FILES + [
+        f for f in [p.name for p in artifact_dir.glob("*")]
+        if f not in ARTIFACT_FILES and (
+            f.endswith(".diff") or f.endswith(".md") or f.endswith(".txt")
+        )
+    ]
+    for name in all_names:
         path = artifact_dir / name
         if not path.exists():
             continue
-
-        already = (
-            db.query(Artifact)
-            .filter(Artifact.run_id == run_id, Artifact.name == name)
-            .first()
-        )
+        already = db.query(Artifact).filter(
+            Artifact.run_id == run_id, Artifact.name == name
+        ).first()
         if already:
+            already.size_bytes = path.stat().st_size
             continue
-
         db.add(Artifact(
-            run_id=run_id,
-            name=name,
-            path=str(path),
-            size_bytes=path.stat().st_size,
+            run_id=run_id, name=name,
+            path=str(path), size_bytes=path.stat().st_size,
         ))
-
     db.commit()
-
-
-def _check_disk_quota(workspace_root: Path) -> None:
-    limit_mb = int(os.environ.get("MAX_DISK_MB", "500"))
-    used_bytes = sum(f.stat().st_size for f in workspace_root.rglob("*") if f.is_file())
-    limit_bytes = limit_mb * 1024 * 1024
-    if used_bytes > limit_bytes:
-        raise RuntimeError(
-            f"Disk quota exceeded: {used_bytes // (1024 * 1024)}MB > {limit_mb}MB"
-        )
 
 
 def demo_run(run_id: str, repo_url: str | None = None) -> None:
@@ -214,89 +262,116 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
             task_id=None,
         )
 
-        artifacts: Dict[str, Any] = {
-            "artifact_dir": str(artifact_dir),
-        }
+        artifacts: Dict[str, Any] = {"artifact_dir": str(artifact_dir)}
         agents = _build_agents()
-        manager = agents["manager"]
-        current_task_db_id: str | None = None
 
         _add_log(db, run_id, "INFO", "orchestrator",
                  f"Run started | run_id={run_id} | repo_url={repo_url or '[missing]'}")
 
+        # ── Phase 1: Analysis pipeline ──────────────────────────────────
         _update_agent(db, run_id, "manager", "working", "Building task plan")
-        plan = manager.build_plan(repo_url=repo_url)
+        plan = agents["manager"].build_plan(repo_url=repo_url)
         _update_agent(db, run_id, "manager", "idle", "Plan created")
 
         for planned in plan:
-            task_db_id = str(uuid.uuid4())
-            current_task_db_id = task_db_id
-
-            task_row = Task(
-                id=task_db_id,
-                run_id=run_id,
-                title=planned.title,
-                task_type=planned.task_type,
-                assigned_agent=planned.assigned_agent,
-                status="pending",
-                created_at=utcnow(),
-                updated_at=utcnow(),
-            )
-            db.add(task_row)
-            db.commit()
-
-            task_row.status = "in_progress"
-            task_row.updated_at = utcnow()
-            db.commit()
-
-            _update_agent(db, run_id, planned.assigned_agent, "working", f"Starting: {planned.title}")
-
-            payload = _build_payload(planned, artifacts)
-            agent = agents[planned.assigned_agent]
-            ctx.task_id = task_db_id
-
-            timeout_seconds = int(os.environ.get("MAX_TASK_TIMEOUT_SECONDS", "300"))
-
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(agent.run_task, planned.task_type, ctx, payload)
-                try:
-                    result = future.result(timeout=timeout_seconds)
-                except FutureTimeoutError:
-                    raise RuntimeError(
-                        f"Task timed out after {timeout_seconds}s: {planned.title}"
-                    )
+            payload = _build_payload(planned.task_type, artifacts, dict(planned.payload))
+            result, task_db_id = _run_single_task(db, run_id, planned, agents, ctx, payload)
 
             for key, value in result.items():
                 if key != "result_message":
                     artifacts[key] = value
 
-            result_message = str(result.get("result_message", "Done"))
-
-            task_row.status = "completed"
-            task_row.result = result_message
-            task_row.updated_at = utcnow()
-            db.commit()
-
-            _update_agent(db, run_id, planned.assigned_agent, "idle", result_message)
-
-            _add_log(db, run_id, "INFO", "orchestrator",
-                     f"Task completed | agent={planned.assigned_agent} | {result_message}")
-
-            _check_disk_quota(workspace_root)
-
             if planned.task_type == "clone_repository":
                 _add_log(db, run_id, "INFO", "orchestrator",
-                         f"Clone result keys: {list(result.keys())} | "
-                         f"values: {dict(list(result.items())[:5])}")
+                         f"Clone result: {dict(list(result.items())[:5])}")
                 _register_repo(db, run_id, repo_url or "", artifacts, workspace_root)
 
             if planned.task_type == "write_artifacts":
                 _register_artifacts(db, run_id, artifact_dir)
 
+            _check_disk_quota(workspace_root)
+
+        # ── Phase 3: Fix iteration loop ──────────────────────────────────
+        enable_fix_loop = os.environ.get("ENABLE_FIX_LOOP", "false").lower() == "true"
+
+        if enable_fix_loop and artifacts.get("qa_findings_md"):
+            _add_log(db, run_id, "INFO", "orchestrator",
+                     f"Starting fix loop | max_iterations={MAX_FIX_ITERATIONS}")
+
+            from backend.core.tasks import PlannedTask as PT
+
+            for iteration in range(1, MAX_FIX_ITERATIONS + 1):
+                run_row = db.query(Run).filter(Run.id == run_id).first()
+                if run_row:
+                    run_row.current_iteration = iteration
+                    db.commit()
+
+                _add_log(db, run_id, "INFO", "orchestrator",
+                         f"Fix iteration {iteration}/{MAX_FIX_ITERATIONS}")
+
+                # 1. Generate fix
+                fix_task = PT(
+                    title=f"Generate fix (iter {iteration})",
+                    task_type="generate_fix",
+                    assigned_agent="dev_1",
+                    payload={"iteration": iteration, "past_failures": artifacts.get("past_failures", [])},
+                )
+                fix_payload = _build_payload("generate_fix", artifacts, dict(fix_task.payload))
+                fix_result, _ = _run_single_task(db, run_id, fix_task, agents, ctx, fix_payload, iteration)
+                artifacts.update({k: v for k, v in fix_result.items() if k != "result_message"})
+
+                # 2. Run tests
+                test_task = PT(
+                    title=f"Run tests (iter {iteration})",
+                    task_type="run_tests",
+                    assigned_agent="qa_1",
+                    payload={"iteration": iteration},
+                )
+                test_payload = _build_payload("run_tests", artifacts, dict(test_task.payload))
+                test_result, _ = _run_single_task(db, run_id, test_task, agents, ctx, test_payload, iteration)
+                artifacts.update({k: v for k, v in test_result.items() if k != "result_message"})
+
+                # 3. Review diff (with optional human gate)
+                review_task = PT(
+                    title=f"Review diff (iter {iteration})",
+                    task_type="review_diff",
+                    assigned_agent="reviewer",
+                    payload={"iteration": iteration},
+                )
+                review_payload = _build_payload("review_diff", artifacts, dict(review_task.payload))
+                review_result, review_task_db_id = _run_single_task(
+                    db, run_id, review_task, agents, ctx, review_payload, iteration
+                )
+                artifacts.update({k: v for k, v in review_result.items() if k != "result_message"})
+
+                approved = review_result.get("approved", False)
+                tests_passed = artifacts.get("tests_passed", False)
+
+                if approved and tests_passed:
+                    _add_log(db, run_id, "INFO", "orchestrator",
+                             f"Fix approved at iteration {iteration} ✅")
+                    break
+                else:
+                    reason = "rejected by reviewer" if not approved else "tests still failing"
+                    _add_log(db, run_id, "INFO", "orchestrator",
+                             f"Iteration {iteration} {reason} — trying again")
+                    past = artifacts.get("past_failures", [])
+                    past.append({
+                        "iteration": iteration,
+                        "test_output": artifacts.get("test_output", "")[:500],
+                        "approved": approved,
+                    })
+                    artifacts["past_failures"] = past
+
+            # Re-register artifacts to pick up diff/test files
+            _register_artifacts(db, run_id, artifact_dir)
+
+        # ── Finalize ────────────────────────────────────────────────────
         run_row = db.query(Run).filter(Run.id == run_id).first()
         if run_row:
             run_row.status = "completed"
             run_row.finished_at = utcnow()
+            run_row.awaiting_approval = False
             db.commit()
 
         _add_log(db, run_id, "INFO", "orchestrator", f"Run finished | run_id={run_id}")
@@ -304,18 +379,6 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
     except Exception as e:
         _add_log(db, run_id, "ERROR", "orchestrator",
                  f"Run failed | run_id={run_id} | error={e}")
-
-        if current_task_db_id:
-            try:
-                t = db.query(Task).filter(Task.id == current_task_db_id).first()
-                if t:
-                    t.status = "failed"
-                    t.result = str(e)
-                    t.updated_at = utcnow()
-                    db.commit()
-            except Exception:
-                pass
-
         try:
             run_row = db.query(Run).filter(Run.id == run_id).first()
             if run_row:
@@ -324,8 +387,6 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
                 db.commit()
         except Exception:
             pass
-
         raise
-
     finally:
         db.close()

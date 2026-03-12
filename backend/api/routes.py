@@ -1,16 +1,23 @@
 from __future__ import annotations
+
+import io
+import os
+import shutil
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import APIRouter, Depends
-from fastapi.responses import JSONResponse
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from sqlalchemy import extract, func
 from sqlalchemy.orm import Session
-import os
-from backend.db.models import LLMCall
-from sqlalchemy import func, extract
-from backend.db.models import AgentEvent, Log, Run, Task, Artifact, utcnow
+
+from backend.db.models import (
+    AgentEvent, Artifact, LLMCall, Log, Repository, Run, Task, utcnow,
+)
 from backend.db.session import get_db
 from backend.tasks.pipeline_task import run_pipeline
 
@@ -24,6 +31,8 @@ class RunRequest(BaseModel):
     repo_url: str | None = None
 
 
+# ── Tasks ──────────────────────────────────────────────────────────────────────
+
 @router.get("/api/tasks/{run_id}")
 def api_tasks(run_id: str, db: Session = Depends(get_db)):
     tasks = (
@@ -34,16 +43,20 @@ def api_tasks(run_id: str, db: Session = Depends(get_db)):
     )
     return JSONResponse([
         {
-            "id": str(t.id),
-            "title": t.title,
-            "task_type": t.task_type if hasattr(t, "task_type") else "",
-            "status": t.status,
+            "id":             str(t.id),
+            "title":          t.title,
+            "task_type":      t.task_type if hasattr(t, "task_type") else "",
+            "status":         t.status,
             "assigned_agent": t.assigned_agent,
-            "result": t.result,
+            "result":         t.result,
+            "iteration":      t.iteration if hasattr(t, "iteration") and t.iteration is not None else 0,
+            "approved":       t.approved  if hasattr(t, "approved") else None,
         }
         for t in tasks
     ])
 
+
+# ── Logs ───────────────────────────────────────────────────────────────────────
 
 @router.get("/api/logs/{run_id}")
 def api_logs(run_id: str, db: Session = Depends(get_db)):
@@ -56,25 +69,25 @@ def api_logs(run_id: str, db: Session = Depends(get_db)):
     )
     return JSONResponse([
         {
-            "ts": l.ts.timestamp(),
-            "level": l.level,
-            "source": l.source,
+            "ts":      l.ts.timestamp(),
+            "level":   l.level,
+            "source":  l.source,
             "message": l.message,
         }
         for l in logs
     ])
 
 
+# ── State ──────────────────────────────────────────────────────────────────────
+
 @router.get("/api/state")
 def api_state(db: Session = Depends(get_db)):
-    # Get most recent run (running OR completed/failed)
     latest_run = (
         db.query(Run)
         .order_by(Run.started_at.desc())
         .first()
     )
 
-    # Separate flag for whether a run is actively in progress
     active_run = (
         db.query(Run)
         .filter(Run.status == "running")
@@ -83,21 +96,23 @@ def api_state(db: Session = Depends(get_db)):
     )
 
     run_in_progress = active_run is not None
-    display_run = active_run or latest_run  # show latest if nothing running
-    run_id = str(display_run.id) if display_run else None
+    display_run     = active_run or latest_run
+    run_id          = str(display_run.id) if display_run else None
 
-    tasks = []
+    tasks  = []
     agents = []
-    logs = []
+    logs   = []
 
     if display_run:
         tasks = [
             {
-                "id": str(t.id)[:8],
-                "title": t.title,
-                "status": t.status,
+                "id":             str(t.id)[:8],
+                "title":          t.title,
+                "status":         t.status,
                 "assigned_agent": t.assigned_agent,
-                "result": t.result,
+                "result":         t.result,
+                "iteration":      t.iteration if hasattr(t, "iteration") and t.iteration is not None else 0,
+                "approved":       t.approved  if hasattr(t, "approved") else None,
             }
             for t in db.query(Task)
             .filter(Task.run_id == display_run.id)
@@ -127,20 +142,20 @@ def api_state(db: Session = Depends(get_db)):
         event_lookup = {a.agent_key: a for a in agent_rows}
         agents = [
             {
-                "name": key,
-                "role": key,
-                "status": event_lookup[key].status if key in event_lookup else "idle",
+                "name":            key,
+                "role":            key,
+                "status":          event_lookup[key].status if key in event_lookup else "idle",
                 "current_task_id": None,
-                "last_action": event_lookup[key].action if key in event_lookup else None,
+                "last_action":     event_lookup[key].action if key in event_lookup else None,
             }
             for key in AGENT_KEYS
         ]
 
         logs = [
             {
-                "ts": l.ts.timestamp(),
-                "level": l.level,
-                "source": l.source,
+                "ts":      l.ts.timestamp(),
+                "level":   l.level,
+                "source":  l.source,
                 "message": l.message,
             }
             for l in db.query(Log)
@@ -153,25 +168,25 @@ def api_state(db: Session = Depends(get_db)):
     else:
         agents = [
             {
-                "name": key,
-                "role": key,
-                "status": "idle",
+                "name":            key,
+                "role":            key,
+                "status":          "idle",
                 "current_task_id": None,
-                "last_action": None,
+                "last_action":     None,
             }
             for key in AGENT_KEYS
         ]
 
-    return JSONResponse(
-        {
-            "run_in_progress": run_in_progress,
-            "run_id": run_id,
-            "agents": agents,
-            "tasks": tasks,
-            "logs": logs,
-        }
-    )
+    return JSONResponse({
+        "run_in_progress": run_in_progress,
+        "run_id":          run_id,
+        "agents":          agents,
+        "tasks":           tasks,
+        "logs":            logs,
+    })
 
+
+# ── Start run ──────────────────────────────────────────────────────────────────
 
 @router.post("/api/run")
 def api_run(
@@ -202,47 +217,175 @@ def api_run(
     db.commit()
     db.refresh(run)
 
-    # Dispatch to Celery and store task_id in run.note for cancellation
     celery_task = run_pipeline.apply_async(
         kwargs={"run_id": str(run.id), "repo_url": repo_url},
         queue="pipeline",
     )
 
-    # Store celery task id so Reset can revoke it
     run.note = celery_task.id
     db.commit()
 
     return JSONResponse({"ok": True, "status": "started", "run_id": str(run.id)})
 
 
-import shutil
-from fastapi.responses import FileResponse, StreamingResponse
-import zipfile
-import io
-from backend.db.models import Repository
+# ── Approve / Reject (Phase 3) ─────────────────────────────────────────────────
 
+@router.post("/api/runs/{run_id}/approve")
+def approve_fix(run_id: str, db: Session = Depends(get_db)):
+    task = (
+        db.query(Task)
+        .filter(
+            Task.run_id == run_id,
+            Task.task_type == "review_diff",
+            Task.approved.is_(None),
+        )
+        .order_by(Task.created_at.desc())
+        .first()
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="No pending review_diff task found")
+
+    task.approved   = True
+    task.updated_at = datetime.now(timezone.utc)
+
+    run = db.query(Run).filter(Run.id == run_id).first()
+    if run and hasattr(run, "awaiting_approval"):
+        run.awaiting_approval = False
+
+    db.commit()
+    return JSONResponse({"ok": True, "approved": True})
+
+
+@router.post("/api/runs/{run_id}/reject")
+def reject_fix(run_id: str, db: Session = Depends(get_db)):
+    task = (
+        db.query(Task)
+        .filter(
+            Task.run_id == run_id,
+            Task.task_type == "review_diff",
+            Task.approved.is_(None),
+        )
+        .order_by(Task.created_at.desc())
+        .first()
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="No pending review_diff task found")
+
+    task.approved   = False
+    task.updated_at = datetime.now(timezone.utc)
+
+    run = db.query(Run).filter(Run.id == run_id).first()
+    if run and hasattr(run, "awaiting_approval"):
+        run.awaiting_approval = False
+
+    db.commit()
+    return JSONResponse({"ok": True, "approved": False})
+
+
+# ── Repos ──────────────────────────────────────────────────────────────────────
 
 @router.get("/api/repos")
 def api_repos(db: Session = Depends(get_db)):
-    """List all known repositories."""
     repos = db.query(Repository).order_by(Repository.cloned_at.desc()).all()
     return JSONResponse([
         {
-            "id":         str(r.id),
-            "name":       r.name,
-            "url":        r.url,
-            "local_path": r.local_path,
-            "disk_bytes": r.disk_bytes,
-            "cloned_at":  r.cloned_at.isoformat() if r.cloned_at else None,
+            "id":          str(r.id),
+            "name":        r.name,
+            "url":         r.url,
+            "local_path":  r.local_path,
+            "disk_bytes":  r.disk_bytes,
+            "cloned_at":   r.cloned_at.isoformat() if r.cloned_at else None,
             "last_run_id": str(r.last_run_id) if r.last_run_id else None,
         }
         for r in repos
     ])
 
 
+@router.delete("/api/repos/{repo_id}")
+def api_delete_repo(repo_id: str, db: Session = Depends(get_db)):
+    repo = db.query(Repository).filter(Repository.id == repo_id).first()
+    if not repo:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    path = Path(repo.local_path)
+    if path.exists():
+        shutil.rmtree(path)
+
+    run_ids_to_clean = [
+        str(r.id) for r in
+        db.query(Run).filter(Run.repo_url == repo.url).all()
+    ]
+
+    repo.last_run_id = None
+    db.commit()
+
+    for rid in run_ids_to_clean:
+        db.query(Artifact).filter(Artifact.run_id == rid).delete()
+        db.query(Log).filter(Log.run_id == rid).delete()
+        db.query(Task).filter(Task.run_id == rid).delete()
+        db.query(AgentEvent).filter(AgentEvent.run_id == rid).delete()
+        db.query(Run).filter(Run.id == rid).delete()
+
+        run_artifact_path = Path("workspace") / "runs" / rid
+        if run_artifact_path.exists():
+            shutil.rmtree(run_artifact_path)
+
+    db.commit()
+    db.delete(repo)
+    db.commit()
+
+    return JSONResponse({"ok": True, "deleted": repo.name})
+
+
+@router.get("/api/repos/{repo_id}/download")
+def api_download_repo(repo_id: str, db: Session = Depends(get_db)):
+    repo = db.query(Repository).filter(Repository.id == repo_id).first()
+    if not repo:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    path = Path(repo.local_path)
+    if not path.exists():
+        return JSONResponse({"error": "repo not on disk"}, status_code=404)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file in path.rglob("*"):
+            if file.is_file() and ".git" not in file.parts:
+                zf.write(file, file.relative_to(path.parent))
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={repo.name}.zip"},
+    )
+
+
+@router.get("/api/repos/{repo_id}/files")
+def api_repo_files(repo_id: str, db: Session = Depends(get_db)):
+    repo = db.query(Repository).filter(Repository.id == repo_id).first()
+    if not repo:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    path = Path(repo.local_path)
+    if not path.exists():
+        return JSONResponse([])
+
+    files = [
+        {
+            "path":       str(f.relative_to(path)),
+            "size_bytes": f.stat().st_size,
+        }
+        for f in path.rglob("*")
+        if f.is_file() and ".git" not in f.parts
+    ]
+    return JSONResponse(sorted(files, key=lambda x: x["path"]))
+
+
+# ── Costs ──────────────────────────────────────────────────────────────────────
+
 @router.get("/api/costs")
 def api_costs(db: Session = Depends(get_db)):
-    from datetime import datetime, timezone
     now    = datetime.now(timezone.utc)
     budget = float(os.environ.get("LLM_BUDGET_USD", "15.00"))
 
@@ -308,132 +451,12 @@ def api_costs(db: Session = Depends(get_db)):
 
 @router.post("/api/costs/refresh-pricing")
 def api_refresh_pricing():
-    """Force refresh of LLM pricing cache from litellm."""
     from backend.core.pricing import refresh_now
     count = refresh_now()
     return JSONResponse({"ok": True, "models_loaded": count})
 
 
-@router.delete("/api/repos/{repo_id}")
-def api_delete_repo(repo_id: str, db: Session = Depends(get_db)):
-    repo = db.query(Repository).filter(Repository.id == repo_id).first()
-    if not repo:
-        return JSONResponse({"error": "not found"}, status_code=404)
-
-    # Delete from disk
-    path = Path(repo.local_path)
-    if path.exists():
-        shutil.rmtree(path)
-
-    # Find all runs for this repo URL
-    run_ids_to_clean = [
-        str(r.id) for r in
-        db.query(Run).filter(Run.repo_url == repo.url).all()
-    ]
-
-    # ── Must null FK before deleting runs ───────────────────────
-    repo.last_run_id = None
-    db.commit()
-
-    # Now safe to delete runs and all dependent rows
-    for rid in run_ids_to_clean:
-        db.query(Artifact).filter(Artifact.run_id == rid).delete()
-        db.query(Log).filter(Log.run_id == rid).delete()
-        db.query(Task).filter(Task.run_id == rid).delete()
-        db.query(AgentEvent).filter(AgentEvent.run_id == rid).delete()
-        db.query(Run).filter(Run.id == rid).delete()
-
-        # Delete run artifact folder from disk
-        run_artifact_path = Path("workspace") / "runs" / rid
-        if run_artifact_path.exists():
-            shutil.rmtree(run_artifact_path)
-
-    db.commit()
-
-    db.delete(repo)
-    db.commit()
-
-    return JSONResponse({"ok": True, "deleted": repo.name})
-
-
-
-
-@router.get("/api/repos/{repo_id}/download")
-def api_download_repo(repo_id: str, db: Session = Depends(get_db)):
-    """Zip the repo folder and stream it to the browser."""
-    repo = db.query(Repository).filter(Repository.id == repo_id).first()
-    if not repo:
-        return JSONResponse({"error": "not found"}, status_code=404)
-
-    path = Path(repo.local_path)
-    if not path.exists():
-        return JSONResponse({"error": "repo not on disk"}, status_code=404)
-
-    # Build zip in memory
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file in path.rglob("*"):
-            if file.is_file() and ".git" not in file.parts:
-                zf.write(file, file.relative_to(path.parent))
-    buf.seek(0)
-
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={repo.name}.zip"},
-    )
-
-
-@router.get("/api/repos/{repo_id}/files")
-def api_repo_files(repo_id: str, db: Session = Depends(get_db)):
-    """List all files in a repo (excluding .git)."""
-    repo = db.query(Repository).filter(Repository.id == repo_id).first()
-    if not repo:
-        return JSONResponse({"error": "not found"}, status_code=404)
-
-    path = Path(repo.local_path)
-    if not path.exists():
-        return JSONResponse([])
-
-    files = [
-        {
-            "path": str(f.relative_to(path)),
-            "size_bytes": f.stat().st_size,
-        }
-        for f in path.rglob("*")
-        if f.is_file() and ".git" not in f.parts
-    ]
-    return JSONResponse(sorted(files, key=lambda x: x["path"]))
-
-
-@router.post("/api/reset")
-def api_reset(db: Session = Depends(get_db)):
-    from backend.tasks.celery_app import celery_app
-
-    # 1. Find all running runs
-    running_runs = db.query(Run).filter(Run.status == "running").all()
-
-    for run in running_runs:
-        # 2. Revoke the Celery task if still in queue/executing
-        # We stored the celery task id in run.note — see api_run below
-        if run.note:
-            celery_app.control.revoke(run.note, terminate=True, signal="SIGTERM")
-
-        # 3. Mark run as failed
-        run.status = "failed"
-        run.finished_at = utcnow()
-
-        # 4. Mark all pending/in_progress tasks as failed
-        db.query(Task).filter(
-            Task.run_id == run.id,
-            Task.status.in_(["pending", "in_progress"]),
-        ).update({"status": "failed", "result": "Reset by user"})
-
-    db.commit()
-
-    return JSONResponse({"ok": True})
-
-
+# ── Runs ───────────────────────────────────────────────────────────────────────
 
 @router.get("/api/runs")
 def api_runs(db: Session = Depends(get_db), limit: int = 20):
@@ -443,18 +466,21 @@ def api_runs(db: Session = Depends(get_db), limit: int = 20):
         .limit(limit)
         .all()
     )
-    return JSONResponse(
-        [
-            {
-                "id": str(r.id),
-                "status": r.status,
-                "repo_url": r.repo_url,
-                "started_at": r.started_at.isoformat() if r.started_at else None,
-                "finished_at": r.finished_at.isoformat() if r.finished_at else None,
-            }
-            for r in runs
-        ]
-    )
+    return JSONResponse([
+        {
+            "id":                str(r.id),
+            "status":            r.status,
+            "repo_url":          r.repo_url,
+            "started_at":        r.started_at.isoformat() if r.started_at else None,
+            "finished_at":       r.finished_at.isoformat() if r.finished_at else None,
+            "current_iteration": r.current_iteration if hasattr(r, "current_iteration") and r.current_iteration is not None else 0,
+            "awaiting_approval": r.awaiting_approval if hasattr(r, "awaiting_approval") and r.awaiting_approval is not None else False,
+        }
+        for r in runs
+    ])
+
+
+# ── Artifacts ──────────────────────────────────────────────────────────────────
 
 @router.get("/api/artifacts/{run_id}")
 def api_artifacts(run_id: str, db: Session = Depends(get_db)):
@@ -466,8 +492,8 @@ def api_artifacts(run_id: str, db: Session = Depends(get_db)):
     )
     return JSONResponse([
         {
-            "id": str(a.id),
-            "name": a.name,
+            "id":         str(a.id),
+            "name":       a.name,
             "size_bytes": a.size_bytes,
         }
         for a in artifacts
@@ -490,3 +516,26 @@ def api_artifact_content(run_id: str, name: str, db: Session = Depends(get_db)):
 
     return JSONResponse({"name": name, "content": path.read_text(encoding="utf-8")})
 
+
+# ── Reset ──────────────────────────────────────────────────────────────────────
+
+@router.post("/api/reset")
+def api_reset(db: Session = Depends(get_db)):
+    from backend.tasks.celery_app import celery_app
+
+    running_runs = db.query(Run).filter(Run.status == "running").all()
+
+    for run in running_runs:
+        if run.note:
+            celery_app.control.revoke(run.note, terminate=True, signal="SIGTERM")
+
+        run.status      = "failed"
+        run.finished_at = utcnow()
+
+        db.query(Task).filter(
+            Task.run_id == run.id,
+            Task.status.in_(["pending", "in_progress"]),
+        ).update({"status": "failed", "result": "Reset by user"})
+
+    db.commit()
+    return JSONResponse({"ok": True})

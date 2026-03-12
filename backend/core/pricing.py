@@ -6,19 +6,16 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional
-
+from backend.core.config import LLMConfig
 import urllib.request
 
 logger = logging.getLogger(__name__)
 
 # Fallback hardcoded prices (USD per 1K tokens)
 # Update this only if litellm fetch is completely broken
-_FALLBACK: dict[str, dict[str, float]] = {
-    "claude-3-5-sonnet-20241022": {"prompt": 0.003,   "completion": 0.015},
-    "claude-3-5-haiku-20241022":  {"prompt": 0.0008,  "completion": 0.004},
-    "claude-3-opus-20240229":     {"prompt": 0.015,   "completion": 0.075},
-    "claude-3-sonnet-20240229":   {"prompt": 0.003,   "completion": 0.015},
-    "claude-3-haiku-20240307":    {"prompt": 0.00025, "completion": 0.00125},
+PRICES = {
+    LLMConfig.MODEL_CHEAP:       {"prompt": 0.0008,  "completion": 0.004},
+    "claude-3-haiku-20240307":   {"prompt": 0.00025, "completion": 0.00125},
 }
 
 # litellm maintains this — updated with every provider price change
@@ -75,7 +72,7 @@ def get_price(model: str) -> dict[str, float]:
             except Exception as e:
                 logger.warning(f"Could not fetch live pricing from litellm: {e} — using fallback")
                 if not _cache:
-                    _cache = dict(_FALLBACK)
+                    _cache = dict(PRICES)
                     _cache_ts = now
 
     # Try exact match first, then prefix match (e.g. "claude-3-5-sonnet" → latest)
@@ -88,7 +85,7 @@ def get_price(model: str) -> dict[str, float]:
 
     # Final fallback
     logger.warning(f"No pricing found for model '{model}' — using default sonnet rate")
-    return _FALLBACK.get(model, {"prompt": 0.003, "completion": 0.015})
+    return PRICES.get(model, {"prompt": 0.003, "completion": 0.015})
 
 
 def refresh_now() -> int:

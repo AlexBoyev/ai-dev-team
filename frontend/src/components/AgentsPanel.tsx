@@ -1,23 +1,35 @@
-import type { Agent } from "../types";
 import { Bot } from "lucide-react";
+import type { Agent } from "../types";
 
 const EMOJI: Record<string, string> = {
-  manager: "🧠", dev_1: "💻", qa_1: "🔍", reviewer: "👁️", devops: "⚙️",
+  manager:  "🧠",
+  dev_1:    "💻",
+  qa_1:     "🔍",
+  reviewer: "👁️",
+  devops:   "⚙️",
 };
 
-interface Props { agents: Agent[]; }
+interface Props {
+  agents: Agent[];
+}
 
 export default function AgentsPanel({ agents }: Props) {
   return (
     <div className="card">
       <div className="card-header">
-        <span className="card-title"><Bot size={15} /> Agents</span>
+        <Bot size={15} />
+        <span className="card-title">Agents</span>
       </div>
       <div className="card-body">
         <div className="agents-grid">
+          {agents.length === 0 && (
+            <p className="empty">No agents active</p>
+          )}
           {agents.map((a) => (
             <div key={a.name} className={`agent-card ${a.status}`}>
-              <div className="agent-avatar">{EMOJI[a.name] ?? "🤖"}</div>
+              <div className="agent-avatar">
+                {EMOJI[a.name] ?? "🤖"}
+              </div>
               <div className="agent-info">
                 <div className="agent-name">{a.name}</div>
                 <div className="agent-action">
@@ -25,12 +37,13 @@ export default function AgentsPanel({ agents }: Props) {
                 </div>
               </div>
               <span className={`badge badge-${a.status}`}>
-                <span className={`dot ${a.status === "working" ? "dot-pulse" : ""}`} />
+                <span
+                  className={`dot ${a.status === "working" ? "dot-pulse" : ""}`}
+                />
                 {a.status}
               </span>
             </div>
           ))}
-          {agents.length === 0 && <p className="empty">No agents active</p>}
         </div>
       </div>
     </div>

@@ -1,37 +1,27 @@
-# backend/agents/developer_agent.py
 from __future__ import annotations
 
+import re
+import logging
 from typing import Any, Dict, List, Tuple
 
 from backend.agents.base_agent import BaseAgent, AgentProfile
 from backend.tools.tool_registry import ToolContext
 
+logger = logging.getLogger(__name__)
+
 
 class DeveloperAgent(BaseAgent):
     IGNORED_DIR_NAMES = {
-        ".git",
-        "node_modules",
-        "dist",
-        "build",
-        "__pycache__",
-        ".venv",
-        "venv",
-        ".idea",
-        ".vscode",
-        "coverage",
-        "out",
-        "target",
-        "bin",
-        "obj",
+        ".git", "node_modules", "dist", "build", "__pycache__",
+        ".venv", "venv", ".idea", ".vscode", "coverage",
+        "out", "target", "bin", "obj",
     }
 
     BLOCKED_EXTENSIONS = {
         ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp",
-        ".mp3", ".wav", ".ogg",
-        ".mp4", ".avi", ".mov",
+        ".mp3", ".wav", ".ogg", ".mp4", ".avi", ".mov",
         ".zip", ".tar", ".gz", ".7z", ".rar",
-        ".exe", ".dll", ".so", ".dylib",
-        ".pdf",
+        ".exe", ".dll", ".so", ".dylib", ".pdf",
         ".ttf", ".otf", ".woff", ".woff2",
         ".pack", ".idx", ".bin",
         ".fbx", ".obj", ".blend", ".asset",
@@ -75,37 +65,34 @@ class DeveloperAgent(BaseAgent):
 
         if task_name == "inventory_workspace":
             return self._task_inventory_workspace(ctx, target_subdir)
-
         if task_name == "select_key_files":
             return self._task_select_key_files(payload)
-
         if task_name == "summarize_key_files":
             return self._task_summarize_key_files(ctx, target_subdir, payload)
-
         if task_name == "scan_and_report":
             return self._task_scan_and_report(ctx, target_subdir)
+        if task_name == "generate_fix":
+            return self._task_generate_fix(ctx, target_subdir, payload)
 
-        raise ValueError(f"DeveloperAgent: unknown task_name={task_name}")
+        raise ValueError(f"DeveloperAgent: unknown task_name={task_name!r}")
 
     # ── inventory_workspace ──────────────────────────────────────────────
 
-    def _task_inventory_workspace(
-        self, ctx: ToolContext, target_subdir: str
-    ) -> Dict[str, Any]:
-        files    = self._tool(ctx, "list_workspace_files_in_dir",  relative_dir=target_subdir)
-        metadata = self._tool(ctx, "get_workspace_file_metadata",  relative_dir=target_subdir)
+    def _task_inventory_workspace(self, ctx: ToolContext, target_subdir: str) -> Dict[str, Any]:
+        files    = self._tool(ctx, "list_workspace_files_in_dir", relative_dir=target_subdir)
+        metadata = self._tool(ctx, "get_workspace_file_metadata", relative_dir=target_subdir)
 
         filtered_files = [p for p in files    if self._is_candidate_path(p)]
         filtered_meta  = [i for i in metadata if self._is_candidate_path(str(i.get("path", "")))]
 
-        truncated            = False
+        truncated             = False
         total_candidate_files = len(filtered_files)
 
         if len(filtered_files) > self.MAX_INDEXED_FILES:
-            filtered_files = filtered_files[: self.MAX_INDEXED_FILES]
-            allowed        = set(filtered_files)
-            filtered_meta  = [i for i in filtered_meta if str(i.get("path", "")) in allowed]
-            truncated      = True
+            filtered_files = filtered_files[:self.MAX_INDEXED_FILES]
+            allowed       = set(filtered_files)
+            filtered_meta = [i for i in filtered_meta if str(i.get("path", "")) in allowed]
+            truncated     = True
 
         return {
             "workspace_files":    filtered_files,
@@ -130,8 +117,8 @@ class DeveloperAgent(BaseAgent):
         metadata = payload.get("workspace_metadata", [])
         selected = self._select_key_files(metadata)
         return {
-            "selected_files":  selected,
-            "result_message":  f"Selected {len(selected)} key files",
+            "selected_files": selected,
+            "result_message": f"Selected {len(selected)} key files",
         }
 
     # ── summarize_key_files ──────────────────────────────────────────────
@@ -145,13 +132,9 @@ class DeveloperAgent(BaseAgent):
 
         for rel_path in selected_files:
             if not self._is_candidate_path(rel_path):
-                skipped_files.append({
-                    "path":   rel_path,
-                    "reason": "Filtered out as ignored or non-source path",
-                })
+                skipped_files.append({"path": rel_path, "reason": "Filtered out as ignored or non-source path"})
                 continue
 
-            # Size check
             try:
                 metadata_list = self._tool(ctx, "get_workspace_file_metadata", relative_dir=target_subdir)
                 size_lookup   = {str(i.get("path", "")): int(i.get("size", 0)) for i in metadata_list}
@@ -160,28 +143,20 @@ class DeveloperAgent(BaseAgent):
                 file_size = 0
 
             if file_size > self.MAX_FILE_SIZE_BYTES:
-                skipped_files.append({
-                    "path":   rel_path,
-                    "reason": f"File size {file_size} exceeds limit {self.MAX_FILE_SIZE_BYTES}",
-                })
+                skipped_files.append({"path": rel_path, "reason": f"File size {file_size} exceeds limit {self.MAX_FILE_SIZE_BYTES}"})
                 continue
 
-            # Read
             try:
                 content = self._tool(ctx, "read_workspace_file", relative_path=rel_path)
             except Exception as e:
                 skipped_files.append({"path": rel_path, "reason": str(e)})
                 continue
 
-            file_contents.append({"path": rel_path, "content": content[: self.MAX_SUMMARY_CHARS]})
+            file_contents.append({"path": rel_path, "content": content[:self.MAX_SUMMARY_CHARS]})
 
-        # ── LLM call ─────────────────────────────────────────────────────
         llm_output = self._call_llm(
             prompt_name="summarize_key_files",
-            context={
-                "target_subdir": target_subdir,
-                "file_contents": file_contents,
-            },
+            context={"target_subdir": target_subdir, "file_contents": file_contents},
             ctx=ctx,
         )
 
@@ -189,7 +164,6 @@ class DeveloperAgent(BaseAgent):
             code_summary_md = llm_output
             summaries = [{"path": f["path"], "summary": "(see LLM output)"} for f in file_contents]
         else:
-            # Fallback: rule-based
             summaries = [
                 {"path": f["path"], "summary": self._summarize_text(f["path"], f["content"])}
                 for f in file_contents
@@ -216,14 +190,12 @@ class DeveloperAgent(BaseAgent):
 
     # ── scan_and_report ──────────────────────────────────────────────────
 
-    def _task_scan_and_report(
-        self, ctx: ToolContext, target_subdir: str
-    ) -> Dict[str, Any]:
+    def _task_scan_and_report(self, ctx: ToolContext, target_subdir: str) -> Dict[str, Any]:
         scan_result    = self._tool(ctx, "scan_workspace_in_dir",  relative_dir=target_subdir)
         base_report_md = self._tool(ctx, "build_scan_report_md",   scan_result=scan_result)
 
-        metadata        = self._tool(ctx, "get_workspace_file_metadata",  relative_dir=target_subdir)
-        workspace_files = self._tool(ctx, "list_workspace_files_in_dir",  relative_dir=target_subdir)
+        metadata        = self._tool(ctx, "get_workspace_file_metadata", relative_dir=target_subdir)
+        workspace_files = self._tool(ctx, "list_workspace_files_in_dir", relative_dir=target_subdir)
 
         candidate_meta  = [i for i in metadata        if self._is_candidate_path(str(i.get("path", "")))]
         candidate_files = [p for p in workspace_files if self._is_candidate_path(p)]
@@ -234,7 +206,6 @@ class DeveloperAgent(BaseAgent):
             workspace_metadata=candidate_meta,
         )
 
-        # ── LLM call ─────────────────────────────────────────────────────
         llm_output = self._call_llm(
             prompt_name="scan_and_report",
             context={
@@ -254,14 +225,15 @@ class DeveloperAgent(BaseAgent):
         if llm_output:
             report_md = llm_output
         else:
-            # Fallback: rule-based report
+            langs     = ", ".join(intelligence["languages"]) if intelligence["languages"] else "Unknown"
+            fworks    = ", ".join(intelligence["frameworks"]) if intelligence["frameworks"] else "None detected"
             report_lines = [
                 "# Repository Report", "",
                 f"Target subdir: `{target_subdir or '.'}`", "",
                 "## Project overview", "",
                 f"- Project type: {intelligence['project_type']}",
-                f"- Languages: {', '.join(intelligence['languages']) if intelligence['languages'] else 'Unknown'}",
-                f"- Frameworks / tools: {', '.join(intelligence['frameworks']) if intelligence['frameworks'] else 'None detected'}",
+                f"- Languages: {langs}",
+                f"- Frameworks / tools: {fworks}",
                 f"- Assets detected: {'Yes' if intelligence['assets_detected'] else 'No'}", "",
                 "## How it likely runs", "",
             ]
@@ -309,7 +281,90 @@ class DeveloperAgent(BaseAgent):
             "result_message":    "Scan complete",
         }
 
-    # ── Repository intelligence helpers ──────────────────────────────────
+    # ── generate_fix (NEW — Phase 3) ─────────────────────────────────────
+
+    def _task_generate_fix(
+        self, ctx: ToolContext, target_subdir: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        qa_findings_md = str(payload.get("qa_findings_md", ""))
+        selected_files = payload.get("selected_files", [])
+        iteration      = int(payload.get("iteration", 1))
+        past_failures  = payload.get("past_failures", [])
+
+        file_contents: List[Dict[str, str]] = []
+        for rel_path in selected_files[:10]:
+            try:
+                content = self._tool(ctx, "read_workspace_file", relative_path=rel_path)
+                file_contents.append({"path": rel_path, "content": content[:3000]})
+            except Exception:
+                continue
+
+        fix_plan_md = self._call_llm(
+            prompt_name="generate_fix",
+            context={
+                "qa_findings_md": qa_findings_md[:4000],
+                "file_contents":  file_contents,
+                "target_subdir":  target_subdir,
+                "iteration":      iteration,
+                "past_failures":  past_failures,
+            },
+            ctx=ctx,
+        )
+
+        if not fix_plan_md:
+            return {
+                "fix_plan_md":    "No fix generated (LLM unavailable).",
+                "fix_diff":       "(no diff)",
+                "files_changed":  [],
+                "result_message": "Fix generation skipped (no LLM)",
+            }
+
+        # Parse fenced code blocks: ```lang path/to/file.ext
+        files_changed: List[str] = []
+        pattern = re.compile(r"```(?:\w+)?\s+([\w./\-]+\.\w+)\n(.*?)```", re.DOTALL)
+        for match in pattern.finditer(fix_plan_md):
+            rel_path_in_repo = match.group(1).strip()
+            code_content     = match.group(2)
+            full_rel = (
+                target_subdir.rstrip("/") + "/" + rel_path_in_repo
+                if target_subdir
+                else rel_path_in_repo
+            )
+            try:
+                self._tool(ctx, "write_code_file", relative_path=full_rel, content=code_content)
+                files_changed.append(rel_path_in_repo)
+            except Exception as e:
+                logger.warning("Could not write fix for %s: %s", full_rel, e)
+
+        diff_output = "(no git diff available)"
+        try:
+            diff_output = self._tool(ctx, "git_diff", relative_dir=target_subdir)
+        except Exception:
+            pass
+
+        try:
+            commit_msg = "AI fix iteration {}: {}".format(
+                iteration, ", ".join(files_changed[:3]) or "no files"
+            )
+            self._tool(ctx, "git_commit", relative_dir=target_subdir, message=commit_msg)
+        except Exception:
+            pass
+
+        if ctx.run_id:
+            diff_path = f"runs/{ctx.run_id}/fix_diff_iter{iteration}.diff"
+            try:
+                self._tool(ctx, "write_workspace_file", relative_path=diff_path, content=diff_output)
+            except Exception:
+                pass
+
+        return {
+            "fix_plan_md":    fix_plan_md,
+            "fix_diff":       diff_output,
+            "files_changed":  files_changed,
+            "result_message": f"Fix applied: {len(files_changed)} files changed (iter {iteration})",
+        }
+
+    # ── Repository intelligence ───────────────────────────────────────────
 
     def _build_repo_intelligence(
         self,
@@ -317,7 +372,7 @@ class DeveloperAgent(BaseAgent):
         workspace_files: List[str],
         workspace_metadata: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        paths = set(workspace_files)
+        paths           = set(workspace_files)
         languages       = self._detect_languages(workspace_metadata)
         frameworks      = self._detect_frameworks(paths)
         assets_detected = self._detect_assets(workspace_files)
@@ -327,15 +382,15 @@ class DeveloperAgent(BaseAgent):
         run_hints       = self._build_run_hints(paths, frameworks, languages)
         reading_order   = self._build_reading_order(workspace_files, important_files, entrypoints)
         return {
-            "target_subdir":    target_subdir,
-            "project_type":     project_type,
-            "languages":        languages,
-            "frameworks":       frameworks,
-            "assets_detected":  assets_detected,
-            "important_files":  important_files,
-            "entrypoints":      entrypoints,
-            "run_hints":        run_hints,
-            "reading_order":    reading_order,
+            "target_subdir":   target_subdir,
+            "project_type":    project_type,
+            "languages":       languages,
+            "frameworks":      frameworks,
+            "assets_detected": assets_detected,
+            "important_files": important_files,
+            "entrypoints":     entrypoints,
+            "run_hints":       run_hints,
+            "reading_order":   reading_order,
         }
 
     def _detect_languages(self, metadata: List[Dict[str, Any]]) -> List[str]:
@@ -379,15 +434,10 @@ class DeveloperAgent(BaseAgent):
             frameworks.append("Django")
         if has("main.py") and has("requirements.txt"):
             frameworks.append("Python app")
-        if any(p.endswith("package.json") and "next" in p.lower() for p in paths):
-            frameworks.append("Next.js")
         return frameworks
 
     def _detect_assets(self, workspace_files: List[str]) -> bool:
-        asset_markers = (
-            "/assets/", "/sprites/", "/images/",
-            "/audio/", "/sounds/", "/textures/", "/models/",
-        )
+        asset_markers = ("/assets/", "/sprites/", "/images/", "/audio/", "/sounds/", "/textures/", "/models/")
         for path in workspace_files:
             normalized = f"/{path.lower()}/"
             if any(marker in normalized for marker in asset_markers):
@@ -395,23 +445,19 @@ class DeveloperAgent(BaseAgent):
         return False
 
     def _detect_project_type(
-        self,
-        paths: set,
-        languages: List[str],
-        frameworks: List[str],
-        assets_detected: bool,
+        self, paths: set, languages: List[str], frameworks: List[str], assets_detected: bool
     ) -> str:
         if assets_detected:
-            if "Python" in " ".join(languages):
-                return "Game or interactive project (likely Python-based)"
-            return "Game or interactive project"
+            return (
+                "Game or interactive project (likely Python-based)"
+                if "Python" in " ".join(languages)
+                else "Game or interactive project"
+            )
         if any(p.endswith("package.json") for p in paths) and any(
             p.endswith(("index.html", "vite.config.ts", "vite.config.js")) for p in paths
         ):
             return "Frontend web application"
-        if "Python" in languages and any(
-            p.endswith(("main.py", "app.py", "manage.py")) for p in paths
-        ):
+        if "Python" in languages and any(p.endswith(("main.py", "app.py", "manage.py")) for p in paths):
             return "Python application"
         if any(p.endswith(("pom.xml", "build.gradle", "build.gradle.kts")) for p in paths):
             return "JVM application"
@@ -428,12 +474,10 @@ class DeveloperAgent(BaseAgent):
         for path in workspace_files:
             filename = path.split("/")[-1]
             score = 0
-            if filename in self.PREFERRED_NAMES:                     score += 100
-            if filename.lower().startswith("readme"):                 score += 120
-            if path.endswith(("requirements.txt", "pyproject.toml",
-                               "package.json", "Dockerfile")):        score += 80
-            if path.endswith(("main.py", "app.py", "manage.py",
-                               "index.html")):                        score += 70
+            if filename in self.PREFERRED_NAMES:                                          score += 100
+            if filename.lower().startswith("readme"):                                      score += 120
+            if path.endswith(("requirements.txt", "pyproject.toml", "package.json", "Dockerfile")): score += 80
+            if path.endswith(("main.py", "app.py", "manage.py", "index.html")):           score += 70
             if score > 0:
                 scored.append((score, path))
         scored.sort(key=lambda x: (-x[0], x[1]))
@@ -444,17 +488,15 @@ class DeveloperAgent(BaseAgent):
         for path in workspace_files:
             filename = path.split("/")[-1].lower()
             score = 0
-            if filename in {"main.py", "app.py", "manage.py", "run.py"}:  score += 100
-            if filename in {"index.html", "server.py"}:                    score += 80
-            if "/src/" in f"/{path}/":                                     score += 10
+            if filename in {"main.py", "app.py", "manage.py", "run.py"}: score += 100
+            if filename in {"index.html", "server.py"}:                   score += 80
+            if "/src/" in f"/{path}/":                                    score += 10
             if score > 0:
                 candidates.append((score, path))
         candidates.sort(key=lambda x: (-x[0], x[1]))
         return [p for _, p in candidates[:6]]
 
-    def _build_run_hints(
-        self, paths: set, frameworks: List[str], languages: List[str]
-    ) -> List[str]:
+    def _build_run_hints(self, paths: set, frameworks: List[str], languages: List[str]) -> List[str]:
         hints: List[str] = []
 
         def has(name: str) -> bool:
@@ -476,10 +518,6 @@ class DeveloperAgent(BaseAgent):
             hints.append("Multi-service run may use `docker compose up`")
         if has("Makefile"):
             hints.append("Build/run shortcuts may be defined in `Makefile`")
-        if has("pom.xml"):
-            hints.append("Likely JVM build: `mvn test` / `mvn spring-boot:run` depending on project type")
-        if has("build.gradle") or has("build.gradle.kts"):
-            hints.append("Likely JVM build: use Gradle tasks such as `gradle build` or `gradle run`")
         if has("go.mod"):
             hints.append("Likely run: `go run .` or `go test ./...`")
         if has("Cargo.toml"):
@@ -519,42 +557,38 @@ class DeveloperAgent(BaseAgent):
             path = str(item.get("path", ""))
             if not self._is_candidate_path(path):
                 continue
-            size = int(item.get("size", 0))
+            size     = int(item.get("size", 0))
             if size > self.MAX_FILE_SIZE_BYTES:
                 continue
             filename = path.split("/")[-1]
             ext      = self._get_extension(filename)
             score    = 0
-            if filename in self.PREFERRED_NAMES:                      score += 100
-            if filename.lower().startswith("readme"):                  score += 120
-            if ext in self.ALLOWED_EXTENSIONS:                         score += 30
-            if path.endswith(("requirements.txt", "pyproject.toml",
-                               "package.json", "Dockerfile")):         score += 70
-            if path.endswith(("main.py", "app.py", "manage.py",
-                               "index.html")):                         score += 60
-            if "/src/" in f"/{path}/":                                 score += 20
-            if "/backend/" in f"/{path}/" or "/frontend/" in f"/{path}/": score += 15
-            if "/tests/" in f"/{path}/" or path.startswith("tests/"): score += 10
-            if size > 0:                                               score += min(size // 300, 20)
+            if filename in self.PREFERRED_NAMES:                                               score += 100
+            if filename.lower().startswith("readme"):                                           score += 120
+            if ext in self.ALLOWED_EXTENSIONS:                                                  score += 30
+            if path.endswith(("requirements.txt", "pyproject.toml", "package.json", "Dockerfile")): score += 70
+            if path.endswith(("main.py", "app.py", "manage.py", "index.html")):                score += 60
+            if "/src/" in f"/{path}/":                                                         score += 20
+            if "/backend/" in f"/{path}/" or "/frontend/" in f"/{path}/":                     score += 15
+            if "/tests/" in f"/{path}/" or path.startswith("tests/"):                         score += 10
+            if size > 0:                                                                        score += min(size // 300, 20)
             if score > 0:
                 filtered.append((score, path))
         filtered.sort(key=lambda x: (-x[0], x[1]))
-        return [p for _, p in filtered[: self.MAX_SELECTED_FILES]]
+        return [p for _, p in filtered[:self.MAX_SELECTED_FILES]]
 
     def _summarize_text(self, rel_path: str, content: str) -> str:
         lines         = content.splitlines()
-        preview       = lines[:20]
-        non_empty     = [l.strip() for l in lines if l.strip()]
+        non_empty     = [ln.strip() for ln in lines if ln.strip()]
         first_meaning = non_empty[:5]
         summary_lines = [
             f"- File: `{rel_path}`",
             f"- Approx lines: {len(lines)}",
-            f"- Preview lines used: {len(preview)}",
         ]
         if first_meaning:
             summary_lines.append("- Notable content:")
-            for l in first_meaning:
-                summary_lines.append(f"  - {l[:140]}")
+            for ln in first_meaning:
+                summary_lines.append(f"  - {ln[:140]}")
         else:
             summary_lines.append("- File appears mostly empty.")
         return "\n".join(summary_lines)

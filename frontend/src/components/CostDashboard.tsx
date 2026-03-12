@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
-import { DollarSign, Zap, AlertTriangle, CheckCircle } from "lucide-react";
-import { fetchCosts } from "../api";
+import { DollarSign, Zap, AlertTriangle, CheckCircle, RefreshCw } from "lucide-react";
+import { fetchCosts, refreshPricing } from "../api";
 import type { CostData } from "../types";
 
 interface Props {
@@ -8,11 +8,26 @@ interface Props {
 }
 
 export default function CostDashboard({ refreshTick }: Props) {
-  const [data, setData] = useState<CostData | null>(null);
+  const [data,       setData]       = useState<CostData | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
-  useEffect(() => {
+  function load() {
     fetchCosts().then(setData).catch(() => {});
-  }, [refreshTick]);
+  }
+
+  useEffect(() => { load(); }, [refreshTick]);
+
+  async function handleRefreshPricing() {
+    setRefreshing(true);
+    try {
+      await refreshPricing();
+      load();
+    } catch {
+      // silently ignore
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   if (!data) return null;
 
@@ -30,17 +45,41 @@ export default function CostDashboard({ refreshTick }: Props) {
             &nbsp;{data.period}
           </span>
         </span>
-        {data.within_budget ? (
-          <span style={{ display: "flex", alignItems: "center", gap: 4,
-                         fontSize: 11, color: "#16a34a" }}>
-            <CheckCircle size={12} /> Within budget
-          </span>
-        ) : (
-          <span style={{ display: "flex", alignItems: "center", gap: 4,
-                         fontSize: 11, color: "var(--danger)", fontWeight: 600 }}>
-            <AlertTriangle size={12} /> Budget exceeded!
-          </span>
-        )}
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {data.within_budget ? (
+            <span style={{ display: "flex", alignItems: "center", gap: 4,
+                           fontSize: 11, color: "#16a34a" }}>
+              <CheckCircle size={12} /> Within budget
+            </span>
+          ) : (
+            <span style={{ display: "flex", alignItems: "center", gap: 4,
+                           fontSize: 11, color: "var(--danger)", fontWeight: 600 }}>
+              <AlertTriangle size={12} /> Budget exceeded!
+            </span>
+          )}
+          <button
+            onClick={handleRefreshPricing}
+            disabled={refreshing}
+            title="Refresh LLM pricing cache"
+            style={{
+              display:        "flex",
+              alignItems:     "center",
+              gap:            4,
+              fontSize:       11,
+              padding:        "3px 8px",
+              borderRadius:   6,
+              border:         "1px solid var(--border)",
+              background:     "transparent",
+              color:          "var(--text-soft)",
+              cursor:         refreshing ? "not-allowed" : "pointer",
+              opacity:        refreshing ? 0.6 : 1,
+              transition:     "opacity 0.15s ease",
+            }}
+          >
+            <RefreshCw size={11} style={{ animation: refreshing ? "spin 1s linear infinite" : "none" }} />
+            {refreshing ? "Refreshing..." : "Pricing"}
+          </button>
+        </span>
       </div>
 
       <div className="card-body" style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -59,8 +98,8 @@ export default function CostDashboard({ refreshTick }: Props) {
           <div style={{ height: 8, background: "var(--border)",
                         borderRadius: 4, overflow: "hidden" }}>
             <div style={{
-              height: "100%",
-              width: `${Math.min(data.percent_used, 100)}%`,
+              height:     "100%",
+              width:      `${Math.min(data.percent_used, 100)}%`,
               background: barColor,
               borderRadius: 4,
               transition: "width 0.4s ease",
@@ -89,7 +128,7 @@ export default function CostDashboard({ refreshTick }: Props) {
           </div>
         </div>
 
-        {/* Per-model breakdown — only shown once real calls exist */}
+        {/* Per-model breakdown */}
         {data.per_model.length > 0 && (
           <div>
             <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-soft)",
@@ -108,6 +147,33 @@ export default function CostDashboard({ refreshTick }: Props) {
                   {m.tokens.toLocaleString()} tokens
                 </span>
                 <span style={{ fontWeight: 600 }}>${m.cost_usd.toFixed(4)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Per-run breakdown */}
+        {data.per_run.length > 0 && (
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-soft)",
+                          textTransform: "uppercase", letterSpacing: ".4px", marginBottom: 8 }}>
+              By run
+            </div>
+            {data.per_run.map((r) => (
+              <div key={r.run_id} style={{
+                display: "flex", justifyContent: "space-between", alignItems: "center",
+                padding: "5px 0", borderBottom: "1px solid var(--border)", fontSize: 12,
+              }}>
+                <span style={{ fontFamily: "var(--mono)", color: "var(--text-soft)" }}>
+                  {r.run_id.slice(0, 8)}
+                </span>
+                <span style={{ color: "var(--text-soft)" }}>
+                  {r.calls} calls
+                </span>
+                <span style={{ color: "var(--text-soft)" }}>
+                  {r.tokens.toLocaleString()} tokens
+                </span>
+                <span style={{ fontWeight: 600 }}>${r.cost_usd.toFixed(4)}</span>
               </div>
             ))}
           </div>

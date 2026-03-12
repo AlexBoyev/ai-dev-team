@@ -1,30 +1,41 @@
 from __future__ import annotations
 
 import re
+import time
+import logging
 from typing import Any, Dict, List
 
 from backend.agents.base_agent import BaseAgent, AgentProfile
 from backend.tools.tool_registry import ToolContext
 
+logger = logging.getLogger(__name__)
+
+APPROVAL_POLL_INTERVAL = 3    # seconds between DB checks
+APPROVAL_TIMEOUT       = 300  # 5 minutes max wait
+
 
 class ReviewerAgent(BaseAgent):
     def __init__(self, agent_id: str = "reviewer") -> None:
-        super().__init__(
-            AgentProfile(
-                agent_id=agent_id,
-                display_name="Reviewer",
-                role="Reviewer",
-            )
-        )
+        super().__init__(AgentProfile(
+            agent_id=agent_id,
+            display_name="Reviewer",
+            role="Reviewer",
+        ))
 
     def _run(self, task_name: str, ctx: ToolContext, payload: Dict[str, Any]) -> Dict[str, Any]:
-        if task_name != "review_outputs":
-            raise ValueError(f"ReviewerAgent: unknown task_name={task_name}")
+        if task_name == "review_outputs":
+            return self._task_review_outputs(ctx, payload)
+        if task_name == "review_diff":
+            return self._task_review_diff(ctx, payload)
+        raise ValueError(f"ReviewerAgent: unknown task_name={task_name!r}")
 
-        target_subdir = str(payload.get("target_subdir", "")).strip()
-        report_md = str(payload.get("report_md", ""))
+    # ── review_outputs (existing) ─────────────────────────────────────────
+
+    def _task_review_outputs(self, ctx: ToolContext, payload: Dict[str, Any]) -> Dict[str, Any]:
+        target_subdir   = str(payload.get("target_subdir", "")).strip()
+        report_md       = str(payload.get("report_md", ""))
         code_summary_md = str(payload.get("code_summary_md", ""))
-        qa_findings_md = str(payload.get("qa_findings_md", ""))
+        qa_findings_md  = str(payload.get("qa_findings_md", ""))
 
         review = self._build_review(
             target_subdir=target_subdir,
@@ -33,16 +44,14 @@ class ReviewerAgent(BaseAgent):
             qa_findings_md=qa_findings_md,
         )
 
-        # Rule-based fallback
         rule_based_md = self._render_markdown(target_subdir=target_subdir, review=review)
 
-        # LLM call
         llm_output = self._call_llm(
             prompt_name="review_outputs",
             context={
-                "report_md": report_md,
+                "report_md":       report_md,
                 "code_summary_md": code_summary_md,
-                "qa_findings_md": qa_findings_md,
+                "qa_findings_md":  qa_findings_md,
             },
             ctx=ctx,
         )
@@ -50,10 +59,90 @@ class ReviewerAgent(BaseAgent):
         review_md = llm_output if llm_output else rule_based_md
 
         return {
-            "review": review,
-            "review_md": review_md,
+            "review":         review,
+            "review_md":      review_md,
             "result_message": "Review complete",
         }
+
+    # ── review_diff (NEW — Phase 3) ───────────────────────────────────────
+
+    def _task_review_diff(self, ctx: ToolContext, payload: Dict[str, Any]) -> Dict[str, Any]:
+        fix_diff       = str(payload.get("fix_diff", ""))
+        qa_findings_md = str(payload.get("qa_findings_md", ""))
+        test_output    = str(payload.get("test_output", ""))
+        tests_passed   = bool(payload.get("tests_passed", False))
+        iteration      = int(payload.get("iteration", 1))
+        auto_approve   = bool(payload.get("auto_approve", False))
+
+        llm_output = self._call_llm(
+            prompt_name="review_diff",
+            context={
+                "fix_diff":       fix_diff[:3000],
+                "qa_findings_md": qa_findings_md[:2000],
+                "test_output":    test_output[:2000],
+                "tests_passed":   tests_passed,
+                "iteration":      iteration,
+            },
+            ctx=ctx,
+        )
+
+        if not llm_output:
+            if tests_passed:
+                llm_output = f"## Diff Review — Iteration {iteration}\n\nTests passed. Auto-approving.\n"
+            else:
+                llm_output = f"## Diff Review — Iteration {iteration}\n\nTests failed. Changes need revision.\n"
+
+        if auto_approve:
+            approved = tests_passed
+        else:
+            approved = self._wait_for_human_approval(
+                ctx, getattr(ctx, "task_id", None), iteration
+            )
+
+        if ctx.run_id:
+            artifact_path = f"runs/{ctx.run_id}/review_diff_iter{iteration}.md"
+            try:
+                self._tool(
+                    ctx, "write_workspace_file",
+                    relative_path=artifact_path,
+                    content=llm_output,
+                )
+            except Exception:
+                pass
+
+        verdict = "approved" if approved else "rejected"
+        return {
+            "review_diff_md": llm_output,
+            "approved":       approved,
+            "result_message": f"Diff review: {verdict} (iter {iteration})",
+        }
+
+    # ── human approval polling ────────────────────────────────────────────
+
+    def _wait_for_human_approval(
+        self, ctx: ToolContext, task_db_id: str | None, iteration: int
+    ) -> bool:
+        if not hasattr(ctx, "db") or ctx.db is None or not task_db_id:
+            logger.warning("No DB/task_id available — auto-approving")
+            return True
+
+        from backend.db.models import Task as TaskModel
+
+        logger.info("Waiting for human approval on task %s (iter %d)", task_db_id, iteration)
+        elapsed = 0
+        while elapsed < APPROVAL_TIMEOUT:
+            ctx.db.expire_all()
+            task_row = ctx.db.query(TaskModel).filter(TaskModel.id == task_db_id).first()
+            if task_row and task_row.approved is not None:
+                logger.info("Human decision received: approved=%s", task_row.approved)
+                return bool(task_row.approved)
+            time.sleep(APPROVAL_POLL_INTERVAL)
+            elapsed += APPROVAL_POLL_INTERVAL
+
+        logger.warning("Approval timeout after %ds — auto-rejecting", APPROVAL_TIMEOUT)
+        return False
+
+    # ── review builder ────────────────────────────────────────────────────
 
     def _build_review(
         self,
@@ -62,73 +151,39 @@ class ReviewerAgent(BaseAgent):
         code_summary_md: str,
         qa_findings_md: str,
     ) -> Dict[str, Any]:
-        presence = self._check_presence(
-            report_md=report_md,
-            code_summary_md=code_summary_md,
-            qa_findings_md=qa_findings_md,
-        )
-
-        consistency = self._check_consistency(
-            expected_target_subdir=target_subdir,
-            report_md=report_md,
-            code_summary_md=code_summary_md,
-            qa_findings_md=qa_findings_md,
-        )
-
-        coverage = self._check_coverage(
-            report_md=report_md,
-            code_summary_md=code_summary_md,
-            qa_findings_md=qa_findings_md,
-        )
-
-        strengths = self._build_strengths(
-            presence=presence,
-            consistency=consistency,
-            coverage=coverage,
-        )
-
-        concerns = self._build_concerns(
-            presence=presence,
-            consistency=consistency,
-            coverage=coverage,
-        )
-
-        next_actions = self._build_next_actions(
-            presence=presence,
-            consistency=consistency,
-            coverage=coverage,
-        )
-
-        overall_status = self._derive_status(
-            presence=presence,
-            consistency=consistency,
-            coverage=coverage,
-        )
+        presence     = self._check_presence(report_md, code_summary_md, qa_findings_md)
+        consistency  = self._check_consistency(target_subdir, report_md, code_summary_md, qa_findings_md)
+        coverage     = self._check_coverage(report_md, code_summary_md, qa_findings_md)
+        strengths    = self._build_strengths(presence, consistency, coverage)
+        concerns     = self._build_concerns(presence, consistency, coverage)
+        next_actions = self._build_next_actions(presence, consistency, coverage)
+        overall_status = self._derive_status(presence, consistency, coverage)
 
         return {
             "overall_status": overall_status,
-            "presence": presence,
-            "consistency": consistency,
-            "coverage": coverage,
-            "strengths": strengths,
-            "concerns": concerns,
-            "next_actions": next_actions,
+            "presence":       presence,
+            "consistency":    consistency,
+            "coverage":       coverage,
+            "strengths":      strengths,
+            "concerns":       concerns,
+            "next_actions":   next_actions,
         }
 
+    # ── presence check ────────────────────────────────────────────────────
+
     def _check_presence(
-        self,
-        report_md: str,
-        code_summary_md: str,
-        qa_findings_md: str,
+        self, report_md: str, code_summary_md: str, qa_findings_md: str
     ) -> Dict[str, Any]:
         return {
-            "report_present": bool(report_md.strip()),
+            "report_present":       bool(report_md.strip()),
             "code_summary_present": bool(code_summary_md.strip()),
-            "qa_findings_present": bool(qa_findings_md.strip()),
-            "report_length": len(report_md.strip()),
-            "code_summary_length": len(code_summary_md.strip()),
-            "qa_findings_length": len(qa_findings_md.strip()),
+            "qa_findings_present":  bool(qa_findings_md.strip()),
+            "report_length":        len(report_md.strip()),
+            "code_summary_length":  len(code_summary_md.strip()),
+            "qa_findings_length":   len(qa_findings_md.strip()),
         }
+
+    # ── consistency check ─────────────────────────────────────────────────
 
     def _check_consistency(
         self,
@@ -138,84 +193,59 @@ class ReviewerAgent(BaseAgent):
         qa_findings_md: str,
     ) -> Dict[str, Any]:
         report_target = self._extract_target_subdir(report_md)
-        code_target = self._extract_target_subdir(code_summary_md)
-        qa_target = self._extract_target_subdir(qa_findings_md)
+        code_target   = self._extract_target_subdir(code_summary_md)
+        qa_target     = self._extract_target_subdir(qa_findings_md)
+        expected      = expected_target_subdir or "."
 
-        target_matches = []
-        expected = expected_target_subdir or "."
-
-        for name, actual in (
-            ("report_md", report_target),
-            ("code_summary_md", code_target),
-            ("qa_findings_md", qa_target),
-        ):
-            target_matches.append(
-                {
-                    "artifact": name,
-                    "expected": expected,
-                    "actual": actual or "[missing]",
-                    "matches": (actual == expected),
-                }
+        target_matches = [
+            {
+                "artifact": name,
+                "expected": expected,
+                "actual":   actual or "[missing]",
+                "matches":  actual == expected,
+            }
+            for name, actual in (
+                ("report_md",       report_target),
+                ("code_summary_md", code_target),
+                ("qa_findings_md",  qa_target),
             )
-
-        report_sections = self._extract_headings(report_md)
-        code_sections = self._extract_headings(code_summary_md)
-        qa_sections = self._extract_headings(qa_findings_md)
+        ]
 
         return {
             "report_target_subdir": report_target,
-            "code_target_subdir": code_target,
-            "qa_target_subdir": qa_target,
-            "target_matches": target_matches,
-            "report_sections": report_sections,
-            "code_sections": code_sections,
-            "qa_sections": qa_sections,
+            "code_target_subdir":   code_target,
+            "qa_target_subdir":     qa_target,
+            "target_matches":       target_matches,
+            "report_sections":      self._extract_headings(report_md),
+            "code_sections":        self._extract_headings(code_summary_md),
+            "qa_sections":          self._extract_headings(qa_findings_md),
         }
+
+    # ── coverage check ────────────────────────────────────────────────────
 
     def _check_coverage(
-        self,
-        report_md: str,
-        code_summary_md: str,
-        qa_findings_md: str,
+        self, report_md: str, code_summary_md: str, qa_findings_md: str
     ) -> Dict[str, Any]:
-        report_has_project_overview = "## Project overview" in report_md
-        report_has_run_hints = "## How it likely runs" in report_md
-        report_has_reading_order = "## Where to start reading" in report_md
-        report_has_entrypoints = "## Entrypoint candidates" in report_md
-
-        code_file_sections = self._count_h2_sections(code_summary_md)
-        code_has_skipped_section = "## Skipped files" in code_summary_md
-
-        qa_has_inventory = "## Inventory summary" in qa_findings_md
-        qa_has_structure = "## Structure checks" in qa_findings_md
-        qa_has_risks = "## Risks" in qa_findings_md
-        qa_has_strengths = "## Strengths" in qa_findings_md
-
-        qa_todo_count = self._extract_numeric_bullet(qa_findings_md, "TODO count")
-        qa_fixme_count = self._extract_numeric_bullet(qa_findings_md, "FIXME count")
-        qa_hack_count = self._extract_numeric_bullet(qa_findings_md, "HACK count")
-
         return {
-            "report_has_project_overview": report_has_project_overview,
-            "report_has_run_hints": report_has_run_hints,
-            "report_has_reading_order": report_has_reading_order,
-            "report_has_entrypoints": report_has_entrypoints,
-            "code_file_sections": code_file_sections,
-            "code_has_skipped_section": code_has_skipped_section,
-            "qa_has_inventory": qa_has_inventory,
-            "qa_has_structure": qa_has_structure,
-            "qa_has_risks": qa_has_risks,
-            "qa_has_strengths": qa_has_strengths,
-            "qa_todo_count": qa_todo_count,
-            "qa_fixme_count": qa_fixme_count,
-            "qa_hack_count": qa_hack_count,
+            "report_has_project_overview": "## Project overview"      in report_md,
+            "report_has_run_hints":        "## How it likely runs"     in report_md,
+            "report_has_reading_order":    "## Where to start reading" in report_md,
+            "report_has_entrypoints":      "## Entrypoint candidates"  in report_md,
+            "code_file_sections":          self._count_h2_sections(code_summary_md),
+            "code_has_skipped_section":    "## Skipped files"          in code_summary_md,
+            "qa_has_inventory":            "## Inventory summary"      in qa_findings_md,
+            "qa_has_structure":            "## Structure checks"       in qa_findings_md,
+            "qa_has_risks":                "## Risks"                  in qa_findings_md,
+            "qa_has_strengths":            "## Strengths"              in qa_findings_md,
+            "qa_todo_count":               self._extract_numeric_bullet(qa_findings_md, "TODO count"),
+            "qa_fixme_count":              self._extract_numeric_bullet(qa_findings_md, "FIXME count"),
+            "qa_hack_count":               self._extract_numeric_bullet(qa_findings_md, "HACK count"),
         }
 
+    # ── strengths ─────────────────────────────────────────────────────────
+
     def _build_strengths(
-        self,
-        presence: Dict[str, Any],
-        consistency: Dict[str, Any],
-        coverage: Dict[str, Any],
+        self, presence: Dict, consistency: Dict, coverage: Dict
     ) -> List[str]:
         strengths: List[str] = []
 
@@ -248,95 +278,75 @@ class ReviewerAgent(BaseAgent):
 
         return strengths
 
+    # ── concerns ──────────────────────────────────────────────────────────
+
     def _build_concerns(
-        self,
-        presence: Dict[str, Any],
-        consistency: Dict[str, Any],
-        coverage: Dict[str, Any],
+        self, presence: Dict, consistency: Dict, coverage: Dict
     ) -> List[Dict[str, str]]:
         concerns: List[Dict[str, str]] = []
 
         if not presence["report_present"]:
-            concerns.append(
-                {
-                    "severity": "high",
-                    "title": "Missing repository report",
-                    "detail": "The main repository report artifact is empty or missing.",
-                }
-            )
+            concerns.append({
+                "severity": "high",
+                "title":    "Missing repository report",
+                "detail":   "The main repository report artifact is empty or missing.",
+            })
 
         if not presence["code_summary_present"]:
-            concerns.append(
-                {
-                    "severity": "high",
-                    "title": "Missing code summary",
-                    "detail": "The code summary artifact is empty or missing.",
-                }
-            )
+            concerns.append({
+                "severity": "high",
+                "title":    "Missing code summary",
+                "detail":   "The code summary artifact is empty or missing.",
+            })
 
         if not presence["qa_findings_present"]:
-            concerns.append(
-                {
-                    "severity": "high",
-                    "title": "Missing QA findings",
-                    "detail": "The QA findings artifact is empty or missing.",
-                }
-            )
+            concerns.append({
+                "severity": "high",
+                "title":    "Missing QA findings",
+                "detail":   "The QA findings artifact is empty or missing.",
+            })
 
-        mismatches = [item for item in consistency["target_matches"] if not item["matches"]]
-        if mismatches:
-            concerns.append(
-                {
-                    "severity": "high",
-                    "title": "Artifact target mismatch",
-                    "detail": "Not all generated artifacts reference the same target subdirectory.",
-                }
-            )
+        if any(not item["matches"] for item in consistency["target_matches"]):
+            concerns.append({
+                "severity": "high",
+                "title":    "Artifact target mismatch",
+                "detail":   "Not all generated artifacts reference the same target subdirectory.",
+            })
 
         if not coverage["report_has_project_overview"]:
-            concerns.append(
-                {
-                    "severity": "medium",
-                    "title": "Report lacks project overview",
-                    "detail": "The repository report does not clearly identify what kind of project this is.",
-                }
-            )
+            concerns.append({
+                "severity": "medium",
+                "title":    "Report lacks project overview",
+                "detail":   "The repository report does not clearly identify what kind of project this is.",
+            })
 
         if not coverage["report_has_run_hints"]:
-            concerns.append(
-                {
-                    "severity": "medium",
-                    "title": "Report lacks run guidance",
-                    "detail": "The repository report does not provide likely setup or run hints.",
-                }
-            )
+            concerns.append({
+                "severity": "medium",
+                "title":    "Report lacks run guidance",
+                "detail":   "The repository report does not provide likely setup or run hints.",
+            })
 
         if not coverage["report_has_reading_order"]:
-            concerns.append(
-                {
-                    "severity": "medium",
-                    "title": "Report lacks reading path",
-                    "detail": "The repository report does not guide the reader on where to start.",
-                }
-            )
+            concerns.append({
+                "severity": "medium",
+                "title":    "Report lacks reading path",
+                "detail":   "The repository report does not guide the reader on where to start.",
+            })
 
         if coverage["code_file_sections"] == 0:
-            concerns.append(
-                {
-                    "severity": "medium",
-                    "title": "No summarized file sections",
-                    "detail": "The code summary does not appear to contain per-file sections.",
-                }
-            )
+            concerns.append({
+                "severity": "medium",
+                "title":    "No summarized file sections",
+                "detail":   "The code summary does not appear to contain per-file sections.",
+            })
 
         if not coverage["qa_has_inventory"] or not coverage["qa_has_structure"]:
-            concerns.append(
-                {
-                    "severity": "medium",
-                    "title": "QA findings are structurally incomplete",
-                    "detail": "The QA report is missing inventory or structure checks.",
-                }
-            )
+            concerns.append({
+                "severity": "medium",
+                "title":    "QA findings are structurally incomplete",
+                "detail":   "The QA report is missing inventory or structure checks.",
+            })
 
         total_markers = (
             coverage["qa_todo_count"]
@@ -344,21 +354,18 @@ class ReviewerAgent(BaseAgent):
             + coverage["qa_hack_count"]
         )
         if total_markers >= 10:
-            concerns.append(
-                {
-                    "severity": "medium",
-                    "title": "High number of deferred-work markers",
-                    "detail": f"QA findings report {total_markers} TODO/FIXME/HACK markers.",
-                }
-            )
+            concerns.append({
+                "severity": "medium",
+                "title":    "High number of deferred-work markers",
+                "detail":   f"QA findings report {total_markers} TODO/FIXME/HACK markers.",
+            })
 
         return concerns
 
+    # ── next actions ──────────────────────────────────────────────────────
+
     def _build_next_actions(
-        self,
-        presence: Dict[str, Any],
-        consistency: Dict[str, Any],
-        coverage: Dict[str, Any],
+        self, presence: Dict, consistency: Dict, coverage: Dict
     ) -> List[str]:
         actions: List[str] = []
 
@@ -385,11 +392,10 @@ class ReviewerAgent(BaseAgent):
 
         return actions[:6]
 
+    # ── derive status ─────────────────────────────────────────────────────
+
     def _derive_status(
-        self,
-        presence: Dict[str, Any],
-        consistency: Dict[str, Any],
-        coverage: Dict[str, Any],
+        self, presence: Dict, consistency: Dict, coverage: Dict
     ) -> str:
         if not (
             presence["report_present"]
@@ -413,62 +419,45 @@ class ReviewerAgent(BaseAgent):
 
         return "acceptable"
 
+    # ── helpers ───────────────────────────────────────────────────────────
+
     def _extract_target_subdir(self, md: str) -> str:
         match = re.search(r"Target subdir:\s*`([^`]+)`", md)
-        if match:
-            return match.group(1).strip()
-        return ""
+        return match.group(1).strip() if match else ""
 
     def _extract_headings(self, md: str) -> List[str]:
-        headings: List[str] = []
-        for line in md.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                headings.append(stripped)
-        return headings
+        return [line.strip() for line in md.splitlines() if line.strip().startswith("#")]
 
     def _count_h2_sections(self, md: str) -> int:
-        count = 0
-        for line in md.splitlines():
-            if line.strip().startswith("## "):
-                count += 1
-        return count
+        return sum(1 for line in md.splitlines() if line.strip().startswith("## "))
 
     def _extract_numeric_bullet(self, md: str, label: str) -> int:
-        pattern = rf"-\s*{re.escape(label)}:\s*(\d+)"
-        match = re.search(pattern, md)
-        if match:
-            return int(match.group(1))
-        return 0
+        match = re.search(rf"-\s*{re.escape(label)}:\s*(\d+)", md)
+        return int(match.group(1)) if match else 0
+
+    # ── render_markdown ───────────────────────────────────────────────────
 
     def _render_markdown(self, target_subdir: str, review: Dict[str, Any]) -> str:
-        presence = review["presence"]
-        consistency = review["consistency"]
-        coverage = review["coverage"]
-        strengths = review["strengths"]
-        concerns = review["concerns"]
+        presence     = review["presence"]
+        consistency  = review["consistency"]
+        coverage     = review["coverage"]
+        strengths    = review["strengths"]
+        concerns     = review["concerns"]
         next_actions = review["next_actions"]
 
         lines = [
-            "# Review",
-            "",
-            f"Target subdir: `{target_subdir or '.'}`",
-            "",
-            "## Overall status",
-            "",
-            f"- Status: **{review['overall_status']}**",
-            "",
-            "## Artifact presence",
-            "",
+            "# Review", "",
+            f"Target subdir: `{target_subdir or '.'}`", "",
+            "## Overall status", "",
+            f"- Status: **{review['overall_status']}**", "",
+            "## Artifact presence", "",
             f"- report.md present: {'Yes' if presence['report_present'] else 'No'}",
             f"- code_summary.md present: {'Yes' if presence['code_summary_present'] else 'No'}",
             f"- qa_findings.md present: {'Yes' if presence['qa_findings_present'] else 'No'}",
             f"- report.md length: {presence['report_length']}",
             f"- code_summary.md length: {presence['code_summary_length']}",
             f"- qa_findings.md length: {presence['qa_findings_length']}",
-            "",
-            "## Consistency checks",
-            "",
+            "", "## Consistency checks", "",
         ]
 
         for item in consistency["target_matches"]:
@@ -477,29 +466,23 @@ class ReviewerAgent(BaseAgent):
                 f"(expected `{item['expected']}`) -> {'OK' if item['matches'] else 'MISMATCH'}"
             )
 
-        lines.extend(
-            [
-                "",
-                "## Coverage checks",
-                "",
-                f"- Project overview present: {'Yes' if coverage['report_has_project_overview'] else 'No'}",
-                f"- Run hints present: {'Yes' if coverage['report_has_run_hints'] else 'No'}",
-                f"- Reading order present: {'Yes' if coverage['report_has_reading_order'] else 'No'}",
-                f"- Entrypoint section present: {'Yes' if coverage['report_has_entrypoints'] else 'No'}",
-                f"- Code summary sections: {coverage['code_file_sections']}",
-                f"- Code summary skipped-files section present: {'Yes' if coverage['code_has_skipped_section'] else 'No'}",
-                f"- QA inventory section present: {'Yes' if coverage['qa_has_inventory'] else 'No'}",
-                f"- QA structure section present: {'Yes' if coverage['qa_has_structure'] else 'No'}",
-                f"- QA risks section present: {'Yes' if coverage['qa_has_risks'] else 'No'}",
-                f"- QA strengths section present: {'Yes' if coverage['qa_has_strengths'] else 'No'}",
-                f"- TODO count reported: {coverage['qa_todo_count']}",
-                f"- FIXME count reported: {coverage['qa_fixme_count']}",
-                f"- HACK count reported: {coverage['qa_hack_count']}",
-                "",
-                "## Strengths",
-                "",
-            ]
-        )
+        lines.extend([
+            "", "## Coverage checks", "",
+            f"- Project overview present: {'Yes' if coverage['report_has_project_overview'] else 'No'}",
+            f"- Run hints present: {'Yes' if coverage['report_has_run_hints'] else 'No'}",
+            f"- Reading order present: {'Yes' if coverage['report_has_reading_order'] else 'No'}",
+            f"- Entrypoint section present: {'Yes' if coverage['report_has_entrypoints'] else 'No'}",
+            f"- Code summary sections: {coverage['code_file_sections']}",
+            f"- Code summary skipped-files section present: {'Yes' if coverage['code_has_skipped_section'] else 'No'}",
+            f"- QA inventory section present: {'Yes' if coverage['qa_has_inventory'] else 'No'}",
+            f"- QA structure section present: {'Yes' if coverage['qa_has_structure'] else 'No'}",
+            f"- QA risks section present: {'Yes' if coverage['qa_has_risks'] else 'No'}",
+            f"- QA strengths section present: {'Yes' if coverage['qa_has_strengths'] else 'No'}",
+            f"- TODO count reported: {coverage['qa_todo_count']}",
+            f"- FIXME count reported: {coverage['qa_fixme_count']}",
+            f"- HACK count reported: {coverage['qa_hack_count']}",
+            "", "## Strengths", "",
+        ])
 
         if strengths:
             for item in strengths:
@@ -507,29 +490,15 @@ class ReviewerAgent(BaseAgent):
         else:
             lines.append("- No major strengths recorded.")
 
-        lines.extend(
-            [
-                "",
-                "## Concerns",
-                "",
-            ]
-        )
+        lines.extend(["", "## Concerns", ""])
 
         if concerns:
             for item in concerns:
-                lines.append(
-                    f"- **{item['severity'].upper()}** — {item['title']}: {item['detail']}"
-                )
+                lines.append(f"- **{item['severity'].upper()}** — {item['title']}: {item['detail']}")
         else:
             lines.append("- No major concerns detected.")
 
-        lines.extend(
-            [
-                "",
-                "## Recommended next actions",
-                "",
-            ]
-        )
+        lines.extend(["", "## Recommended next actions", ""])
 
         for idx, action in enumerate(next_actions, start=1):
             lines.append(f"{idx}. {action}")

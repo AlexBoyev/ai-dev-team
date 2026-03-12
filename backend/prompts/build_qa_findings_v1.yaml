@@ -1,6 +1,5 @@
 name: build_qa_findings
 version: 1
-model: claude-3-5-haiku-20241022
 max_tokens: 3000
 temperature: 0.1
 

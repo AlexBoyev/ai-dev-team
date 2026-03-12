@@ -9,7 +9,7 @@ import yaml
 from jinja2 import BaseLoader, Environment, StrictUndefined, Undefined
 
 logger = logging.getLogger(__name__)
-
+from backend.core.config import LLMConfig
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
@@ -71,7 +71,7 @@ def _load_from_disk(name: str, version: int) -> Prompt:
     return Prompt(
         name=data["name"],
         version=int(data["version"]),
-        model=data.get("model", "claude-3-5-haiku-20241022"),
+        model=data.get("model", LLMConfig.MODEL_CHEAP),
         max_tokens=int(data.get("max_tokens", 2000)),
         temperature=float(data.get("temperature", 0.2)),
         system=data.get("system", ""),
