@@ -1,4 +1,3 @@
-# backend/tools/tool_registry.py
 from __future__ import annotations
 
 import json
@@ -16,17 +15,15 @@ class ToolError(RuntimeError):
     pass
 
 
+WRITE_ALLOWED_PREFIXES = ("repos/", "runs/")
+
+
 @dataclass
 class ToolContext:
-    """
-    Runtime context passed to every tool call.
-
-    db and run_id are optional so tests / standalone scripts can build
-    a ToolContext without a live database session.
-    """
     workspace_root: Path
-    db: Any = field(default=None)          # sqlalchemy Session — None in tests
+    db: Any = field(default=None)
     run_id: Optional[str] = field(default=None)
+    task_id: Optional[str] = field(default=None)
 
 
 @dataclass(frozen=True)
@@ -108,6 +105,12 @@ def _is_in_ignored_dir(base_dir: Path, path: Path) -> bool:
     return any(part in IGNORED_DIR_NAMES for part in relative_parts)
 
 
+def _assert_write_allowed(relative_path: str) -> None:
+    normalized = relative_path.replace("\\", "/").lstrip("/")
+    if not any(normalized.startswith(prefix) for prefix in WRITE_ALLOWED_PREFIXES):
+        raise ToolError(f"Write blocked outside allowed paths: {relative_path}")
+
+
 def run_tool(tool_name: str, ctx: ToolContext, **kwargs: Any) -> Any:
     spec = _REGISTRY.get(tool_name)
     if not spec:
@@ -137,6 +140,7 @@ def tool_build_scan_report_md(ctx: ToolContext, scan_result: Any) -> str:
     description="Write a text file inside workspace.",
 )
 def tool_write_workspace_file(ctx: ToolContext, relative_path: str, content: str) -> None:
+    _assert_write_allowed(relative_path)
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     write_text(target, content)
@@ -147,6 +151,7 @@ def tool_write_workspace_file(ctx: ToolContext, relative_path: str, content: str
     description="Write a JSON file inside workspace.",
 )
 def tool_write_workspace_json(ctx: ToolContext, relative_path: str, data: object) -> None:
+    _assert_write_allowed(relative_path)
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -182,15 +187,12 @@ def tool_get_workspace_file_metadata(ctx: ToolContext, relative_dir: str = "") -
             continue
         rel_path = str(path.relative_to(ctx.workspace_root)).replace("\\", "/")
         suffix = path.suffix.lower()
-        try:
-            size = path.stat().st_size
-        except OSError as e:
-            raise ToolError(f"Failed to stat file: {rel_path} | error={e}") from e
+        size = path.stat().st_size
         items.append({
-            "path":   rel_path,
-            "name":   path.name,
+            "path": rel_path,
+            "name": path.name,
             "suffix": suffix,
-            "size":   size,
+            "size": size,
         })
     items.sort(key=lambda x: x["path"])
     return items
@@ -207,7 +209,6 @@ def tool_read_workspace_file(ctx: ToolContext, relative_path: str) -> str:
     if not target.is_file():
         raise ToolError(f"Workspace path is not a file: {relative_path}")
     try:
-        # errors="replace" prevents UTF-8 crashes on files with unexpected encoding
         return target.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         raise ToolError(f"Failed to read workspace file: {relative_path} | error={e}") from e
@@ -253,7 +254,7 @@ def tool_clone_git_repo(ctx: ToolContext, repo_url: str) -> str:
     repos_dir = _ensure_within_workspace(ctx, ctx.workspace_root / "repos")
     repos_dir.mkdir(parents=True, exist_ok=True)
 
-    repo_name  = _extract_repo_name(repo_url)
+    repo_name = _extract_repo_name(repo_url)
     target_dir = _ensure_within_workspace(ctx, repos_dir / repo_name)
 
     if target_dir.exists():
@@ -261,19 +262,16 @@ def tool_clone_git_repo(ctx: ToolContext, repo_url: str) -> str:
             raise ToolError(f"Clone target exists and is not a directory: {target_dir}")
         return str(target_dir.relative_to(ctx.workspace_root)).replace("\\", "/")
 
-    try:
-        completed = subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, str(target_dir)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except Exception as e:
-        raise ToolError(f"git clone failed to start: {e}") from e
+    completed = subprocess.run(
+        ["git", "clone", "--depth", "1", repo_url, str(target_dir)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
     if completed.returncode != 0:
-        stderr  = (completed.stderr or "").strip()
-        stdout  = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
         details = stderr or stdout or "unknown git error"
         if target_dir.exists() and not any(target_dir.iterdir()):
             try:

@@ -1,7 +1,8 @@
-# backend/core/orchestrator.py
 from __future__ import annotations
 
+import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
@@ -37,7 +38,6 @@ def _ensure_workspace() -> Path:
 
 
 def _run_artifact_dir(workspace_root: Path, run_id: str) -> Path:
-    """Each run gets its own artifact folder so runs never overwrite each other."""
     d = workspace_root / "runs" / run_id
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -67,11 +67,11 @@ def _update_agent(db, run_id: str, agent_key: str, status: str, action: str = ""
 
 def _build_agents() -> Dict[str, Any]:
     return {
-        "manager":  ManagerAgent(),
-        "dev_1":    DeveloperAgent(agent_id="dev_1"),
-        "qa_1":     QaAgent(agent_id="qa_1"),
+        "manager": ManagerAgent(),
+        "dev_1": DeveloperAgent(agent_id="dev_1"),
+        "qa_1": QaAgent(agent_id="qa_1"),
         "reviewer": ReviewerAgent(agent_id="reviewer"),
-        "devops":   DevOpsAgent(agent_id="devops"),
+        "devops": DevOpsAgent(agent_id="devops"),
     }
 
 
@@ -97,35 +97,29 @@ def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, An
         payload["selected_files"] = artifacts.get("selected_files", [])
 
     elif task.task_type == "build_qa_findings":
-        payload["workspace_files"]    = artifacts.get("workspace_files", [])
+        payload["workspace_files"] = artifacts.get("workspace_files", [])
         payload["workspace_metadata"] = artifacts.get("workspace_metadata", [])
-        payload["selected_files"]     = artifacts.get("selected_files", [])
-        payload["report_md"]          = artifacts.get("report_md", "")
+        payload["selected_files"] = artifacts.get("selected_files", [])
+        payload["report_md"] = artifacts.get("report_md", "")
 
     elif task.task_type == "review_outputs":
-        payload["report_md"]       = artifacts.get("report_md", "")
+        payload["report_md"] = artifacts.get("report_md", "")
         payload["code_summary_md"] = artifacts.get("code_summary_md", "")
-        payload["qa_findings_md"]  = artifacts.get("qa_findings_md", "")
+        payload["qa_findings_md"] = artifacts.get("qa_findings_md", "")
 
     elif task.task_type == "write_artifacts":
-        payload["workspace_files"]  = artifacts.get("workspace_files", [])
-        payload["selected_files"]   = artifacts.get("selected_files", [])
-        payload["report_md"]        = artifacts.get("report_md", "")
-        payload["code_summary_md"]  = artifacts.get("code_summary_md", "")
-        payload["qa_findings_md"]   = artifacts.get("qa_findings_md", "")
-        payload["review_md"]        = artifacts.get("review_md", "")
-        payload["artifact_dir"]     = str(artifacts.get("artifact_dir", ""))
+        payload["workspace_files"] = artifacts.get("workspace_files", [])
+        payload["selected_files"] = artifacts.get("selected_files", [])
+        payload["report_md"] = artifacts.get("report_md", "")
+        payload["code_summary_md"] = artifacts.get("code_summary_md", "")
+        payload["qa_findings_md"] = artifacts.get("qa_findings_md", "")
+        payload["review_md"] = artifacts.get("review_md", "")
+        payload["artifact_dir"] = str(artifacts.get("artifact_dir", ""))
 
     return payload
 
 
-def _register_repo(
-    db,
-    run_id: str,
-    repo_url: str,
-    artifacts: Dict[str, Any],
-    workspace_root: Path,
-) -> None:
+def _register_repo(db, run_id: str, repo_url: str, artifacts: Dict[str, Any], workspace_root: Path) -> None:
     repo_path_rel = (
         artifacts.get("repo_path")
         or artifacts.get("cloned_path")
@@ -155,9 +149,9 @@ def _register_repo(
 
     existing = db.query(Repository).filter(Repository.name == name).first()
     if existing:
-        existing.disk_bytes  = disk_bytes
+        existing.disk_bytes = disk_bytes
         existing.last_run_id = run_id
-        existing.updated_at  = utcnow()
+        existing.updated_at = utcnow()
     else:
         db.add(Repository(
             name=name,
@@ -172,15 +166,7 @@ def _register_repo(
     db.commit()
 
 
-def _register_artifacts(
-    db,
-    run_id: str,
-    artifact_dir: Path,
-) -> None:
-    """
-    Register output files from the run-specific artifact_dir.
-    Each run writes to workspace/runs/{run_id}/ so files never collide.
-    """
+def _register_artifacts(db, run_id: str, artifact_dir: Path) -> None:
     for name in ARTIFACT_FILES:
         path = artifact_dir / name
         if not path.exists():
@@ -204,39 +190,46 @@ def _register_artifacts(
     db.commit()
 
 
+def _check_disk_quota(workspace_root: Path) -> None:
+    limit_mb = int(os.environ.get("MAX_DISK_MB", "500"))
+    used_bytes = sum(f.stat().st_size for f in workspace_root.rglob("*") if f.is_file())
+    limit_bytes = limit_mb * 1024 * 1024
+    if used_bytes > limit_bytes:
+        raise RuntimeError(
+            f"Disk quota exceeded: {used_bytes // (1024 * 1024)}MB > {limit_mb}MB"
+        )
+
+
 def demo_run(run_id: str, repo_url: str | None = None) -> None:
     db = get_db_session()
 
     try:
         workspace_root = _ensure_workspace()
-        artifact_dir   = _run_artifact_dir(workspace_root, run_id)
+        artifact_dir = _run_artifact_dir(workspace_root, run_id)
 
-        # Pass db + run_id so agents can call llm_client.complete() via _call_llm()
         ctx = ToolContext(
             workspace_root=workspace_root,
             db=db,
             run_id=run_id,
+            task_id=None,
         )
 
         artifacts: Dict[str, Any] = {
             "artifact_dir": str(artifact_dir),
         }
-        agents  = _build_agents()
+        agents = _build_agents()
         manager = agents["manager"]
         current_task_db_id: str | None = None
 
         _add_log(db, run_id, "INFO", "orchestrator",
                  f"Run started | run_id={run_id} | repo_url={repo_url or '[missing]'}")
 
-        # ── Manager builds the plan ──────────────────────────────────────
         _update_agent(db, run_id, "manager", "working", "Building task plan")
         plan = manager.build_plan(repo_url=repo_url)
         _update_agent(db, run_id, "manager", "idle", "Plan created")
 
-        # ── Execute each planned task ────────────────────────────────────
         for planned in plan:
-
-            task_db_id         = str(uuid.uuid4())
+            task_db_id = str(uuid.uuid4())
             current_task_db_id = task_db_id
 
             task_row = Task(
@@ -252,16 +245,26 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
             db.add(task_row)
             db.commit()
 
-            task_row.status     = "in_progress"
+            task_row.status = "in_progress"
             task_row.updated_at = utcnow()
             db.commit()
 
-            _update_agent(db, run_id, planned.assigned_agent,
-                          "working", f"Starting: {planned.title}")
+            _update_agent(db, run_id, planned.assigned_agent, "working", f"Starting: {planned.title}")
 
             payload = _build_payload(planned, artifacts)
-            agent   = agents[planned.assigned_agent]
-            result  = agent.run_task(planned.task_type, ctx, payload)
+            agent = agents[planned.assigned_agent]
+            ctx.task_id = task_db_id
+
+            timeout_seconds = int(os.environ.get("MAX_TASK_TIMEOUT_SECONDS", "300"))
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(agent.run_task, planned.task_type, ctx, payload)
+                try:
+                    result = future.result(timeout=timeout_seconds)
+                except FutureTimeoutError:
+                    raise RuntimeError(
+                        f"Task timed out after {timeout_seconds}s: {planned.title}"
+                    )
 
             for key, value in result.items():
                 if key != "result_message":
@@ -269,8 +272,8 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
 
             result_message = str(result.get("result_message", "Done"))
 
-            task_row.status     = "completed"
-            task_row.result     = result_message
+            task_row.status = "completed"
+            task_row.result = result_message
             task_row.updated_at = utcnow()
             db.commit()
 
@@ -279,7 +282,7 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
             _add_log(db, run_id, "INFO", "orchestrator",
                      f"Task completed | agent={planned.assigned_agent} | {result_message}")
 
-            # ── Post-task hooks ──────────────────────────────────────────
+            _check_disk_quota(workspace_root)
 
             if planned.task_type == "clone_repository":
                 _add_log(db, run_id, "INFO", "orchestrator",
@@ -290,15 +293,13 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
             if planned.task_type == "write_artifacts":
                 _register_artifacts(db, run_id, artifact_dir)
 
-        # ── Mark run completed ───────────────────────────────────────────
         run_row = db.query(Run).filter(Run.id == run_id).first()
         if run_row:
-            run_row.status      = "completed"
+            run_row.status = "completed"
             run_row.finished_at = utcnow()
             db.commit()
 
-        _add_log(db, run_id, "INFO", "orchestrator",
-                 f"Run finished | run_id={run_id}")
+        _add_log(db, run_id, "INFO", "orchestrator", f"Run finished | run_id={run_id}")
 
     except Exception as e:
         _add_log(db, run_id, "ERROR", "orchestrator",
@@ -308,8 +309,8 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
             try:
                 t = db.query(Task).filter(Task.id == current_task_db_id).first()
                 if t:
-                    t.status     = "failed"
-                    t.result     = str(e)
+                    t.status = "failed"
+                    t.result = str(e)
                     t.updated_at = utcnow()
                     db.commit()
             except Exception:
@@ -318,7 +319,7 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
         try:
             run_row = db.query(Run).filter(Run.id == run_id).first()
             if run_row:
-                run_row.status      = "failed"
+                run_row.status = "failed"
                 run_row.finished_at = utcnow()
                 db.commit()
         except Exception:

@@ -1,4 +1,3 @@
-# backend/db/models.py
 from __future__ import annotations
 
 import uuid
@@ -28,11 +27,13 @@ class Run(Base):
     repo_url    = Column(Text, nullable=True)
     note        = Column(Text, nullable=True)
 
-    tasks     = relationship("Task",       back_populates="run", cascade="all, delete-orphan")
-    logs      = relationship("Log",        back_populates="run", cascade="all, delete-orphan")
-    agents    = relationship("AgentEvent", back_populates="run", cascade="all, delete-orphan")
-    artifacts = relationship("Artifact",   back_populates="run", cascade="all, delete-orphan")
-    llm_calls = relationship("LLMCall", foreign_keys="LLMCall.run_id", cascade="all, delete-orphan")
+    tasks      = relationship("Task", back_populates="run", cascade="all, delete-orphan")
+    logs       = relationship("Log", back_populates="run", cascade="all, delete-orphan")
+    agents     = relationship("AgentEvent", back_populates="run", cascade="all, delete-orphan")
+    artifacts  = relationship("Artifact", back_populates="run", cascade="all, delete-orphan")
+    llm_calls  = relationship("LLMCall", foreign_keys="LLMCall.run_id", cascade="all, delete-orphan")
+    agent_logs = relationship("AgentLog", foreign_keys="AgentLog.run_id", cascade="all, delete-orphan")
+    memory_rows = relationship("RunMemory", foreign_keys="RunMemory.run_id", cascade="all, delete-orphan")
 
 
 class Task(Base):
@@ -110,10 +111,34 @@ class LLMCall(Base):
     run_id            = Column(UUID(as_uuid=True), ForeignKey("runs.id"), nullable=True)
     task_id           = Column(UUID(as_uuid=True), ForeignKey("tasks.id"), nullable=True)
     agent_key         = Column(String(64), nullable=True)
-    prompt_name       = Column(String(128), nullable=True)          # ← NEW
+    prompt_name       = Column(String(128), nullable=True)
     model             = Column(String(64), nullable=False)
     prompt_tokens     = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)
     total_tokens      = Column(Integer, default=0)
     cost_usd          = Column(Numeric(10, 6), default=0)
     ts                = Column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentLog(Base):
+    __tablename__ = "agent_logs"
+
+    id         = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id     = Column(UUID(as_uuid=True), ForeignKey("runs.id"), nullable=False)
+    task_id    = Column(UUID(as_uuid=True), ForeignKey("tasks.id"), nullable=True)
+    agent_key  = Column(String(64), nullable=False)
+    event_type = Column(String(64), nullable=False)
+    data_json  = Column(Text, nullable=False, default="{}")
+    ts         = Column(DateTime(timezone=True), default=utcnow)
+
+
+class RunMemory(Base):
+    __tablename__ = "run_memory"
+
+    id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    repo_name   = Column(String(256), nullable=False)
+    run_id      = Column(UUID(as_uuid=True), ForeignKey("runs.id"), nullable=False)
+    agent_key   = Column(String(64), nullable=False)
+    memory_type = Column(String(64), nullable=False)
+    content     = Column(Text, nullable=False)
+    ts          = Column(DateTime(timezone=True), default=utcnow)

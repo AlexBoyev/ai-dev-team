@@ -7,9 +7,9 @@ import time
 from pathlib import Path
 
 COMPOSE_FILE = Path(__file__).parent / "docker-compose.yml"
-ENV_FILE     = Path(__file__).parent / ".env"
-APP_URL      = "http://localhost:3000"
-HEALTH_URL   = "http://localhost:3000/api/state"  # ← through Nginx now
+ENV_FILE = Path(__file__).parent / ".env"
+APP_URL = "http://localhost:3000"
+HEALTH_URL = "http://localhost:3000/api/state"
 
 DOCKER_DESKTOP_PATHS = [
     r"C:\Program Files\Docker\Docker\Docker Desktop.exe",
@@ -110,19 +110,18 @@ def _print_logs_brief() -> None:
 def _tail_logs() -> None:
     print("\n── Live logs (Ctrl+C to stop, containers keep running) ───────")
     try:
-        # Pipe through grep to hide noisy polling GETs
-        ps = subprocess.Popen(
+        subprocess.run(
             ["docker", "compose", "-f", str(COMPOSE_FILE), "logs",
              "--follow", "--tail=15", "backend", "worker"],
-            stdout=subprocess.PIPE, text=True,
+            text=True,
         )
-        for line in ps.stdout:
-            # Skip pure polling GET 200s
-            if "GET /api/" in line and '"200 OK"' in line or "200 OK" in line:
-                continue
-            print(line, end="")
     except KeyboardInterrupt:
         pass
+
+    print("\n\nStopped following logs. Everything still running.\n")
+    print(f"  UI        →  {APP_URL}")
+    print("  Stop all  →  docker compose down")
+    print("  All logs  →  docker compose logs -f\n")
 
 
 def main() -> None:
