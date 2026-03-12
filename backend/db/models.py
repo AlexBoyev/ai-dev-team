@@ -1,9 +1,11 @@
+# backend/db/models.py
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+
 import sqlalchemy as sa
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
 
@@ -22,14 +24,14 @@ class Run(Base):
     id          = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     started_at  = Column(DateTime(timezone=True), default=utcnow)
     finished_at = Column(DateTime(timezone=True), nullable=True)
-    status      = Column(String(32), default="running")  # running / completed / failed
+    status      = Column(String(32), default="running")
     repo_url    = Column(Text, nullable=True)
     note        = Column(Text, nullable=True)
 
-    tasks    = relationship("Task",       back_populates="run", cascade="all, delete-orphan")
-    logs     = relationship("Log",        back_populates="run", cascade="all, delete-orphan")
-    agents   = relationship("AgentEvent", back_populates="run", cascade="all, delete-orphan")
-    artifacts = relationship("Artifact",  back_populates="run", cascade="all, delete-orphan")
+    tasks     = relationship("Task",       back_populates="run", cascade="all, delete-orphan")
+    logs      = relationship("Log",        back_populates="run", cascade="all, delete-orphan")
+    agents    = relationship("AgentEvent", back_populates="run", cascade="all, delete-orphan")
+    artifacts = relationship("Artifact",   back_populates="run", cascade="all, delete-orphan")
     llm_calls = relationship("LLMCall", foreign_keys="LLMCall.run_id", cascade="all, delete-orphan")
 
 
@@ -101,8 +103,6 @@ class Artifact(Base):
     run = relationship("Run", back_populates="artifacts")
 
 
-from sqlalchemy import Numeric  # add to existing imports
-
 class LLMCall(Base):
     __tablename__ = "llm_calls"
 
@@ -110,6 +110,7 @@ class LLMCall(Base):
     run_id            = Column(UUID(as_uuid=True), ForeignKey("runs.id"), nullable=True)
     task_id           = Column(UUID(as_uuid=True), ForeignKey("tasks.id"), nullable=True)
     agent_key         = Column(String(64), nullable=True)
+    prompt_name       = Column(String(128), nullable=True)          # ← NEW
     model             = Column(String(64), nullable=False)
     prompt_tokens     = Column(Integer, default=0)
     completion_tokens = Column(Integer, default=0)

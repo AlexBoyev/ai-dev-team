@@ -102,7 +102,7 @@ def _print_logs_brief() -> None:
     print("\n── Recent deployment logs ────────────────────────────────────")
     subprocess.run(
         ["docker", "compose", "-f", str(COMPOSE_FILE), "logs",
-         "--tail=15", "app", "worker", "frontend"],
+         "--tail=15", "backend", "worker", "frontend"],
         text=True,
     )
 
@@ -110,18 +110,19 @@ def _print_logs_brief() -> None:
 def _tail_logs() -> None:
     print("\n── Live logs (Ctrl+C to stop, containers keep running) ───────")
     try:
-        subprocess.run(
+        # Pipe through grep to hide noisy polling GETs
+        ps = subprocess.Popen(
             ["docker", "compose", "-f", str(COMPOSE_FILE), "logs",
-             "--follow", "--tail=15", "app", "worker"],
-            text=True,
+             "--follow", "--tail=15", "backend", "worker"],
+            stdout=subprocess.PIPE, text=True,
         )
+        for line in ps.stdout:
+            # Skip pure polling GET 200s
+            if "GET /api/" in line and '"200 OK"' in line or "200 OK" in line:
+                continue
+            print(line, end="")
     except KeyboardInterrupt:
         pass
-
-    print("\n\nStopped following logs. Everything still running.\n")
-    print(f"  UI        →  {APP_URL}")
-    print( "  Stop all  →  docker compose down")
-    print( "  All logs  →  docker compose logs -f\n")
 
 
 def main() -> None:

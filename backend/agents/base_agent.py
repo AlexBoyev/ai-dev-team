@@ -103,10 +103,6 @@ class BaseAgent:
 
     @staticmethod
     def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-        """
-        Simple static pricing table (USD per 1M tokens).
-        Falls back to 0 for unknown models.
-        """
         PRICING = {
             "claude-3-5-sonnet-20241022": (3.00, 15.00),
             "claude-3-5-haiku-20241022":  (0.80,  4.00),
@@ -137,6 +133,7 @@ class BaseAgent:
                 id=uuid.uuid4(),
                 run_id=ctx.run_id,
                 agent_key=agent_key,
+                prompt_name=prompt_name,          # ← NEW
                 model=model,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
