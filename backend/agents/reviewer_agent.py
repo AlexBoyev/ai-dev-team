@@ -33,10 +33,21 @@ class ReviewerAgent(BaseAgent):
             qa_findings_md=qa_findings_md,
         )
 
-        review_md = self._render_markdown(
-            target_subdir=target_subdir,
-            review=review,
+        # Rule-based fallback
+        rule_based_md = self._render_markdown(target_subdir=target_subdir, review=review)
+
+        # LLM call
+        llm_output = self._call_llm(
+            prompt_name="review_outputs",
+            context={
+                "report_md": report_md,
+                "code_summary_md": code_summary_md,
+                "qa_findings_md": qa_findings_md,
+            },
+            ctx=ctx,
         )
+
+        review_md = llm_output if llm_output else rule_based_md
 
         return {
             "review": review,

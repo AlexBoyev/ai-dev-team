@@ -1,3 +1,4 @@
+# backend/core/orchestrator.py
 from __future__ import annotations
 
 import uuid
@@ -113,7 +114,6 @@ def _build_payload(task: PlannedTask, artifacts: Dict[str, Any]) -> Dict[str, An
         payload["code_summary_md"]  = artifacts.get("code_summary_md", "")
         payload["qa_findings_md"]   = artifacts.get("qa_findings_md", "")
         payload["review_md"]        = artifacts.get("review_md", "")
-        # Tell the agent WHERE to write files this run
         payload["artifact_dir"]     = str(artifacts.get("artifact_dir", ""))
 
     return payload
@@ -208,14 +208,21 @@ def demo_run(run_id: str, repo_url: str | None = None) -> None:
     db = get_db_session()
 
     try:
-        workspace_root  = _ensure_workspace()
-        artifact_dir    = _run_artifact_dir(workspace_root, run_id)
-        ctx             = ToolContext(workspace_root=workspace_root)
+        workspace_root = _ensure_workspace()
+        artifact_dir   = _run_artifact_dir(workspace_root, run_id)
+
+        # Pass db + run_id so agents can call llm_client.complete() via _call_llm()
+        ctx = ToolContext(
+            workspace_root=workspace_root,
+            db=db,
+            run_id=run_id,
+        )
+
         artifacts: Dict[str, Any] = {
-            "artifact_dir": str(artifact_dir),  # available to all tasks via _build_payload
+            "artifact_dir": str(artifact_dir),
         }
-        agents          = _build_agents()
-        manager         = agents["manager"]
+        agents  = _build_agents()
+        manager = agents["manager"]
         current_task_db_id: str | None = None
 
         _add_log(db, run_id, "INFO", "orchestrator",

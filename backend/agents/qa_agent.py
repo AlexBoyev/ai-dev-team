@@ -38,10 +38,21 @@ class QaAgent(BaseAgent):
             report_md=report_md,
         )
 
-        qa_findings_md = self._render_markdown(
-            target_subdir=target_subdir,
-            findings=findings,
+        # Rule-based markdown — always built, used as fallback
+        rule_based_md = self._render_markdown(target_subdir=target_subdir, findings=findings)
+
+        # LLM call — replaces rule-based output when API key is present
+        llm_output = self._call_llm(
+            prompt_name="build_qa_findings",
+            context={
+                "report_md": report_md,
+                "selected_files": selected_files,
+                "workspace_metadata": workspace_metadata,
+            },
+            ctx=ctx,
         )
+
+        qa_findings_md = llm_output if llm_output else rule_based_md
 
         return {
             "qa_findings": findings,

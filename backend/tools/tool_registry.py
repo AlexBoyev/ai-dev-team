@@ -1,10 +1,11 @@
+# backend/tools/tool_registry.py
 from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from backend.services.scanner_service import build_markdown_report, scan_directory
@@ -15,9 +16,17 @@ class ToolError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
+@dataclass
 class ToolContext:
+    """
+    Runtime context passed to every tool call.
+
+    db and run_id are optional so tests / standalone scripts can build
+    a ToolContext without a live database session.
+    """
     workspace_root: Path
+    db: Any = field(default=None)          # sqlalchemy Session — None in tests
+    run_id: Optional[str] = field(default=None)
 
 
 @dataclass(frozen=True)
@@ -53,7 +62,6 @@ def register_tool(name: str, description: str) -> Callable[[Callable[..., Any]],
             raise ToolError(f"Tool already registered: {name}")
         _REGISTRY[name] = ToolSpec(name=name, description=description, fn=fn)
         return fn
-
     return _decorator
 
 
@@ -64,17 +72,14 @@ def list_tools() -> Dict[str, str]:
 def _ensure_within_workspace(ctx: ToolContext, path: Path) -> Path:
     root = ctx.workspace_root.resolve()
     resolved = path.resolve()
-
     if resolved == root or root in resolved.parents:
         return resolved
-
     raise ToolError(f"Path escapes workspace: {path}")
 
 
 def _resolve_target_dir(ctx: ToolContext, relative_dir: str = "") -> Path:
     if not relative_dir:
         return ctx.workspace_root.resolve()
-
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_dir)
     if not target.exists():
         raise ToolError(f"Target directory does not exist: {relative_dir}")
@@ -86,20 +91,15 @@ def _resolve_target_dir(ctx: ToolContext, relative_dir: str = "") -> Path:
 def _extract_repo_name(repo_url: str) -> str:
     parsed = urlparse(repo_url)
     path = parsed.path.rstrip("/")
-
     if not path:
         raise ToolError(f"Invalid repository URL: {repo_url}")
-
     repo_name = path.split("/")[-1]
     if repo_name.endswith(".git"):
         repo_name = repo_name[:-4]
-
     if not repo_name:
         raise ToolError(f"Could not extract repository name from URL: {repo_url}")
-
     if any(sep in repo_name for sep in ("/", "\\", "..")):
         raise ToolError(f"Unsafe repository name extracted from URL: {repo_url}")
-
     return repo_name
 
 
@@ -159,16 +159,12 @@ def tool_write_workspace_json(ctx: ToolContext, relative_path: str, data: object
 def tool_list_workspace_files_in_dir(ctx: ToolContext, relative_dir: str = "") -> List[str]:
     target_dir = _resolve_target_dir(ctx, relative_dir)
     files: List[str] = []
-
     for path in target_dir.rglob("*"):
         if not path.is_file():
             continue
-
         if _is_in_ignored_dir(target_dir, path):
             continue
-
         files.append(str(path.relative_to(ctx.workspace_root)).replace("\\", "/"))
-
     return sorted(files)
 
 
@@ -179,31 +175,23 @@ def tool_list_workspace_files_in_dir(ctx: ToolContext, relative_dir: str = "") -
 def tool_get_workspace_file_metadata(ctx: ToolContext, relative_dir: str = "") -> List[Dict[str, Any]]:
     target_dir = _resolve_target_dir(ctx, relative_dir)
     items: List[Dict[str, Any]] = []
-
     for path in target_dir.rglob("*"):
         if not path.is_file():
             continue
-
         if _is_in_ignored_dir(target_dir, path):
             continue
-
         rel_path = str(path.relative_to(ctx.workspace_root)).replace("\\", "/")
         suffix = path.suffix.lower()
-
         try:
             size = path.stat().st_size
         except OSError as e:
             raise ToolError(f"Failed to stat file: {rel_path} | error={e}") from e
-
-        items.append(
-            {
-                "path": rel_path,
-                "name": path.name,
-                "suffix": suffix,
-                "size": size,
-            }
-        )
-
+        items.append({
+            "path":   rel_path,
+            "name":   path.name,
+            "suffix": suffix,
+            "size":   size,
+        })
     items.sort(key=lambda x: x["path"])
     return items
 
@@ -214,16 +202,13 @@ def tool_get_workspace_file_metadata(ctx: ToolContext, relative_dir: str = "") -
 )
 def tool_read_workspace_file(ctx: ToolContext, relative_path: str) -> str:
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_path)
-
     if not target.exists():
         raise ToolError(f"Workspace file does not exist: {relative_path}")
     if not target.is_file():
         raise ToolError(f"Workspace path is not a file: {relative_path}")
-
     try:
-        return target.read_text(encoding="utf-8")
-    except UnicodeDecodeError as e:
-        raise ToolError(f"File is not valid UTF-8 text: {relative_path}") from e
+        # errors="replace" prevents UTF-8 crashes on files with unexpected encoding
+        return target.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         raise ToolError(f"Failed to read workspace file: {relative_path} | error={e}") from e
 
@@ -232,32 +217,27 @@ def tool_read_workspace_file(ctx: ToolContext, relative_path: str) -> str:
     name="search_workspace_text",
     description="Search for a text pattern in workspace files or a target directory.",
 )
-def tool_search_workspace_text(ctx: ToolContext, pattern: str, relative_dir: str = "") -> List[Dict[str, Any]]:
+def tool_search_workspace_text(
+    ctx: ToolContext, pattern: str, relative_dir: str = ""
+) -> List[Dict[str, Any]]:
     target_dir = _resolve_target_dir(ctx, relative_dir)
     results: List[Dict[str, Any]] = []
-
     for path in target_dir.rglob("*"):
         if not path.is_file():
             continue
-
         if _is_in_ignored_dir(target_dir, path):
             continue
-
         try:
-            text = path.read_text(encoding="utf-8")
+            text = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-
         for line_no, line in enumerate(text.splitlines(), start=1):
             if pattern.lower() in line.lower():
-                results.append(
-                    {
-                        "path": str(path.relative_to(ctx.workspace_root)).replace("\\", "/"),
-                        "line": line_no,
-                        "text": line.strip(),
-                    }
-                )
-
+                results.append({
+                    "path": str(path.relative_to(ctx.workspace_root)).replace("\\", "/"),
+                    "line": line_no,
+                    "text": line.strip(),
+                })
     return results
 
 
@@ -273,7 +253,7 @@ def tool_clone_git_repo(ctx: ToolContext, repo_url: str) -> str:
     repos_dir = _ensure_within_workspace(ctx, ctx.workspace_root / "repos")
     repos_dir.mkdir(parents=True, exist_ok=True)
 
-    repo_name = _extract_repo_name(repo_url)
+    repo_name  = _extract_repo_name(repo_url)
     target_dir = _ensure_within_workspace(ctx, repos_dir / repo_name)
 
     if target_dir.exists():
@@ -292,16 +272,14 @@ def tool_clone_git_repo(ctx: ToolContext, repo_url: str) -> str:
         raise ToolError(f"git clone failed to start: {e}") from e
 
     if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        stdout = (completed.stdout or "").strip()
+        stderr  = (completed.stderr or "").strip()
+        stdout  = (completed.stdout or "").strip()
         details = stderr or stdout or "unknown git error"
-
         if target_dir.exists() and not any(target_dir.iterdir()):
             try:
                 target_dir.rmdir()
             except OSError:
                 pass
-
         raise ToolError(f"git clone failed for {repo_url}: {details}")
 
     return str(target_dir.relative_to(ctx.workspace_root)).replace("\\", "/")
