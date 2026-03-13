@@ -36,6 +36,8 @@ class DeveloperAgent(BaseAgent):
         ".sh", ".bat", ".ps1", ".env",
     }
 
+    _PATH_PREFIX_RE = re.compile(r"^(?:path/to/|path/|/path/to/|/path/|\./)+")
+
     PREFERRED_NAMES = {
         "README.md", "README.txt", "README",
         "main.py", "app.py", "manage.py",
@@ -110,6 +112,26 @@ class DeveloperAgent(BaseAgent):
                 + (" (truncated)" if truncated else "")
             ),
         }
+
+    def _resolve_fix_path(self, target_subdir: str, rel_path_in_repo: str) -> str:
+        """
+        Normalize the path returned by the LLM.
+        The LLM sometimes returns a full path like 'repos/network/devices/file.py'
+        and sometimes a short path like 'devices/file.py'.
+        Always produce a clean workspace-relative path.
+        """
+        clean_subdir = target_subdir.rstrip("/")
+        clean_path = rel_path_in_repo.strip("/").replace("\\", "/")
+
+        # Already contains the full subdir prefix — use as-is
+        if clean_subdir and clean_path.startswith(clean_subdir + "/"):
+            return clean_path
+
+        # Short path returned — prepend subdir
+        if clean_subdir:
+            return f"{clean_subdir}/{clean_path}"
+
+        return clean_path
 
     # ── select_key_files ─────────────────────────────────────────────────
 
@@ -284,12 +306,12 @@ class DeveloperAgent(BaseAgent):
     # ── generate_fix (NEW — Phase 3) ─────────────────────────────────────
 
     def _task_generate_fix(
-        self, ctx: ToolContext, target_subdir: str, payload: Dict[str, Any]
+            self, ctx: ToolContext, target_subdir: str, payload: Dict[str, Any]
     ) -> Dict[str, Any]:
         qa_findings_md = str(payload.get("qa_findings_md", ""))
         selected_files = payload.get("selected_files", [])
-        iteration      = int(payload.get("iteration", 1))
-        past_failures  = payload.get("past_failures", [])
+        iteration = int(payload.get("iteration", 1))
+        past_failures = payload.get("past_failures", [])
 
         file_contents: List[Dict[str, str]] = []
         for rel_path in selected_files[:10]:
@@ -303,39 +325,51 @@ class DeveloperAgent(BaseAgent):
             prompt_name="generate_fix",
             context={
                 "qa_findings_md": qa_findings_md[:4000],
-                "file_contents":  file_contents,
-                "target_subdir":  target_subdir,
-                "iteration":      iteration,
-                "past_failures":  past_failures,
+                "file_contents": file_contents,
+                "target_subdir": target_subdir,
+                "iteration": iteration,
+                "past_failures": past_failures,
             },
             ctx=ctx,
         )
 
         if not fix_plan_md:
             return {
-                "fix_plan_md":    "No fix generated (LLM unavailable).",
-                "fix_diff":       "(no diff)",
-                "files_changed":  [],
+                "fix_plan_md": "No fix generated (LLM unavailable).",
+                "fix_diff": "(no diff)",
+                "files_changed": [],
                 "result_message": "Fix generation skipped (no LLM)",
             }
 
-        # Parse fenced code blocks: ```lang path/to/file.ext
         files_changed: List[str] = []
         pattern = re.compile(r"```(?:\w+)?\s+([\w./\-]+\.\w+)\n(.*?)```", re.DOTALL)
+
         for match in pattern.finditer(fix_plan_md):
-            rel_path_in_repo = match.group(1).strip()
-            code_content     = match.group(2)
-            full_rel = (
-                target_subdir.rstrip("/") + "/" + rel_path_in_repo
-                if target_subdir
-                else rel_path_in_repo
-            )
+            raw_path = match.group(1).strip()
+            code_content = match.group(2)
+
+            # Strip LLM placeholder prefixes
+            clean_path = self._PATH_PREFIX_RE.sub("", raw_path).strip("/")
+
+            if not clean_path:
+                logger.warning("Skipping empty path after prefix strip: %s", raw_path)
+                continue
+
+            # Skip generic placeholder filenames
+            if clean_path in {"file.py", "file.ts", "file.js", "example.py", "your_file.py"}:
+                logger.warning("Skipping generic placeholder path: %s", clean_path)
+                continue
+
+            full_rel = self._resolve_fix_path(target_subdir, clean_path)
+
             try:
                 self._tool(ctx, "write_code_file", relative_path=full_rel, content=code_content)
-                files_changed.append(rel_path_in_repo)
+                files_changed.append(clean_path)
+                logger.info("Wrote fix: %s", full_rel)
             except Exception as e:
                 logger.warning("Could not write fix for %s: %s", full_rel, e)
 
+        # Get diff BEFORE commit so it shows actual changes
         diff_output = "(no git diff available)"
         try:
             diff_output = self._tool(ctx, "git_diff", relative_dir=target_subdir)
@@ -358,9 +392,9 @@ class DeveloperAgent(BaseAgent):
                 pass
 
         return {
-            "fix_plan_md":    fix_plan_md,
-            "fix_diff":       diff_output,
-            "files_changed":  files_changed,
+            "fix_plan_md": fix_plan_md,
+            "fix_diff": diff_output,
+            "files_changed": files_changed,
             "result_message": f"Fix applied: {len(files_changed)} files changed (iter {iteration})",
         }
 

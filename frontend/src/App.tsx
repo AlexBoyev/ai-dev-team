@@ -12,11 +12,38 @@ import CostDashboard from "./components/CostDashboard";
 
 const EMPTY_STATE: AppState = {
   run_in_progress: false,
-  run_id: null,
-  agents: [],
-  tasks: [],
-  logs: [],
+  run_id:          null,
+  agents:          [],
+  tasks:           [],
+  logs:            [],
 };
+
+function statesEqual(a: AppState, b: AppState): boolean {
+  if (a.run_in_progress !== b.run_in_progress) return false;
+  if (a.run_id          !== b.run_id)          return false;
+  if (a.tasks.length    !== b.tasks.length)    return false;
+  if (a.logs.length     !== b.logs.length)     return false;
+  if (a.agents.length   !== b.agents.length)   return false;
+
+  // Check if any task status/result changed
+  for (let i = 0; i < a.tasks.length; i++) {
+    const ta = a.tasks[i], tb = b.tasks[i];
+    if (
+      ta.id       !== tb.id     ||
+      ta.status   !== tb.status ||
+      ta.result   !== tb.result ||
+      ta.approved !== tb.approved
+    ) return false;
+  }
+
+  // Check if any agent status changed
+  for (let i = 0; i < a.agents.length; i++) {
+    const aa = a.agents[i], ab = b.agents[i];
+    if (aa.status !== ab.status || aa.last_action !== ab.last_action) return false;
+  }
+
+  return true;
+}
 
 export default function App() {
   const [state, setState]               = useState<AppState>(EMPTY_STATE);
@@ -33,13 +60,22 @@ export default function App() {
   const poll = useCallback(async () => {
     try {
       const s = await fetchState();
+
+      // Preserve scroll position — only update state if something actually changed
       setState((prev) => {
-        if (wasRunningRef.current && !s.run_in_progress) {
+        const justFinished = wasRunningRef.current && !s.run_in_progress;
+        wasRunningRef.current = s.run_in_progress;
+
+        if (justFinished) {
           setRefreshTick((t) => t + 1);
         }
-        wasRunningRef.current = s.run_in_progress;
+
+        // Skip re-render entirely if nothing meaningful changed
+        if (statesEqual(prev, s)) return prev;
+
         return s;
       });
+
       if (s.run_id) setLastRunId(s.run_id);
     } catch { /* network blip */ }
   }, []);
@@ -94,16 +130,23 @@ export default function App() {
 
         {error && (
           <div style={{
-            gridColumn: "1 / -1",
-            background: "#fef2f2", border: "1px solid #fecaca",
-            borderRadius: 8, padding: "10px 16px",
-            color: "var(--danger)", fontSize: 13,
-            display: "flex", alignItems: "center", justifyContent: "space-between",
+            gridColumn:   "1 / -1",
+            background:   "#fef2f2",
+            border:       "1px solid #fecaca",
+            borderRadius: 8,
+            padding:      "10px 16px",
+            color:        "var(--danger)",
+            fontSize:     13,
+            display:      "flex",
+            alignItems:   "center",
+            justifyContent: "space-between",
           }}>
             <span>{error}</span>
-            <button onClick={() => setError(null)}
+            <button
+              onClick={() => setError(null)}
               style={{ background: "none", border: "none", cursor: "pointer",
-                       color: "var(--danger)", fontSize: 16 }}>×</button>
+                       color: "var(--danger)", fontSize: 16 }}
+            >×</button>
           </div>
         )}
 

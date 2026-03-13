@@ -300,3 +300,143 @@ def tool_clone_git_repo(ctx: ToolContext, repo_url: str) -> str:
         raise ToolError(f"git clone failed for {repo_url}: {details}")
 
     return str(target_dir.relative_to(ctx.workspace_root)).replace("\\", "/")
+
+@register_tool(
+    name="run_tests",
+    description="Detect and run the test suite in a target directory. Returns pass/fail and output.",
+)
+def tool_run_tests(
+    ctx: ToolContext,
+    relative_dir: str = "",
+    command: str | None = None,
+) -> Dict[str, Any]:
+    import subprocess
+
+    target_dir = ctx.workspace_root / relative_dir if relative_dir else ctx.workspace_root
+    target_dir = target_dir.resolve()
+
+    if not target_dir.exists():
+        return {
+            "passed":  False,
+            "output":  f"Target directory does not exist: {relative_dir}",
+            "command": "",
+        }
+
+    # Auto-detect test runner if no command provided
+    if not command:
+        if (target_dir / "pytest.ini").exists() or \
+           (target_dir / "setup.cfg").exists() or \
+           (target_dir / "pyproject.toml").exists() or \
+           any(target_dir.rglob("test_*.py")) or \
+           any(target_dir.rglob("*_test.py")):
+            command = "python -m pytest --tb=short -q"
+        elif (target_dir / "package.json").exists():
+            command = "npm test --watchAll=false --passWithNoTests"
+        elif (target_dir / "go.mod").exists():
+            command = "go test ./..."
+        elif (target_dir / "Cargo.toml").exists():
+            command = "cargo test"
+        elif (target_dir / "pom.xml").exists():
+            command = "mvn test -q"
+        else:
+            # No test suite detected
+            return {
+                "passed":  True,
+                "output":  "No test suite detected in repository — skipping test execution.",
+                "command": "",
+            }
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(target_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output  = (result.stdout or "") + (result.stderr or "")
+        passed  = result.returncode == 0
+        return {
+            "passed":  passed,
+            "output":  output[:5000],  # cap to avoid giant payloads
+            "command": command,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "passed":  False,
+            "output":  f"Test run timed out after 120s (command: {command})",
+            "command": command,
+        }
+    except Exception as e:
+        return {
+            "passed":  False,
+            "output":  f"Test runner error: {e}",
+            "command": command,
+        }
+
+@register_tool(
+    name="write_code_file",
+    description="Write a source code file inside workspace repos or runs directory.",
+)
+def tool_write_code_file(ctx: ToolContext, relative_path: str, content: str) -> None:
+    relative_path = _normalize_relative(ctx, relative_path)
+    _assert_write_allowed(relative_path)
+    target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write_text(target, content)
+
+@register_tool(
+    name="git_diff",
+    description="Run git diff in a repo directory and return the output string.",
+)
+def tool_git_diff(ctx: ToolContext, relative_dir: str = "") -> str:
+    target_dir = ctx.workspace_root / relative_dir if relative_dir else ctx.workspace_root
+    target_dir = target_dir.resolve()
+
+    if not target_dir.exists():
+        return "(directory does not exist)"
+
+    try:
+        result = subprocess.run(
+            ["git", "diff", "HEAD"],
+            cwd=str(target_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = result.stdout.strip()
+        return output if output else "(no changes detected by git diff)"
+    except Exception as e:
+        return f"(git diff error: {e})"
+
+
+@register_tool(
+    name="git_commit",
+    description="Stage all changes and create a git commit in a repo directory.",
+)
+def tool_git_commit(ctx: ToolContext, relative_dir: str = "", message: str = "AI fix") -> str:
+    target_dir = ctx.workspace_root / relative_dir if relative_dir else ctx.workspace_root
+    target_dir = target_dir.resolve()
+
+    if not target_dir.exists():
+        return "(directory does not exist)"
+
+    try:
+        subprocess.run(["git", "config", "user.email", "ai@dev-team.local"],
+                       cwd=str(target_dir), capture_output=True)
+        subprocess.run(["git", "config", "user.name",  "AI Dev Team"],
+                       cwd=str(target_dir), capture_output=True)
+        subprocess.run(["git", "add", "-A"],
+                       cwd=str(target_dir), capture_output=True, timeout=30)
+        result = subprocess.run(
+            ["git", "commit", "-m", message],
+            cwd=str(target_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.stdout.strip() or result.stderr.strip()
+    except Exception as e:
+        return f"(git commit error: {e})"
+
