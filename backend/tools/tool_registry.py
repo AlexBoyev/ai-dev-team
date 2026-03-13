@@ -105,6 +105,22 @@ def _is_in_ignored_dir(base_dir: Path, path: Path) -> bool:
     return any(part in IGNORED_DIR_NAMES for part in relative_parts)
 
 
+def _normalize_relative(ctx: ToolContext, raw_path: str) -> str:
+    """
+    Always return a clean relative path (no leading slash, no /app/workspace prefix).
+    Handles both:
+      - already relative: "runs/abc/file.json"
+      - absolute inside container: "/app/workspace/runs/abc/file.json"
+    """
+    normalized = raw_path.replace("\\", "/")
+    workspace_str = str(ctx.workspace_root).replace("\\", "/").rstrip("/")
+    if normalized.startswith(workspace_str + "/"):
+        normalized = normalized[len(workspace_str) + 1:]
+    elif normalized.startswith("/app/workspace/"):
+        normalized = normalized[len("/app/workspace/"):]
+    return normalized.lstrip("/")
+
+
 def _assert_write_allowed(relative_path: str) -> None:
     normalized = relative_path.replace("\\", "/").lstrip("/")
     if not any(normalized.startswith(prefix) for prefix in WRITE_ALLOWED_PREFIXES):
@@ -140,6 +156,7 @@ def tool_build_scan_report_md(ctx: ToolContext, scan_result: Any) -> str:
     description="Write a text file inside workspace.",
 )
 def tool_write_workspace_file(ctx: ToolContext, relative_path: str, content: str) -> None:
+    relative_path = _normalize_relative(ctx, relative_path)
     _assert_write_allowed(relative_path)
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -151,6 +168,7 @@ def tool_write_workspace_file(ctx: ToolContext, relative_path: str, content: str
     description="Write a JSON file inside workspace.",
 )
 def tool_write_workspace_json(ctx: ToolContext, relative_path: str, data: object) -> None:
+    relative_path = _normalize_relative(ctx, relative_path)
     _assert_write_allowed(relative_path)
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -203,6 +221,7 @@ def tool_get_workspace_file_metadata(ctx: ToolContext, relative_dir: str = "") -
     description="Read a text file inside workspace.",
 )
 def tool_read_workspace_file(ctx: ToolContext, relative_path: str) -> str:
+    relative_path = _normalize_relative(ctx, relative_path)
     target = _ensure_within_workspace(ctx, ctx.workspace_root / relative_path)
     if not target.exists():
         raise ToolError(f"Workspace file does not exist: {relative_path}")
